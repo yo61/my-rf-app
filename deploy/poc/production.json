@@ -9,7 +9,22 @@
       "DATABASE_DRIVER": "neon"
     },
     "bindings": {
-      "FILES": { "type": "r2", "bucket": "my-app-files" }
+      "FILES": {
+        "type": "r2",
+        "bucket": "my-app-files"
+      },
+      "RATE_LIMIT_KV": {
+        "type": "kv",
+        "title": "my-app-rate-limit"
+      },
+      "JOBS_QUEUE": {
+        "type": "queue",
+        "queue": "my-app-jobs"
+      },
+      "AGENT_RUN_WORKFLOW": {
+        "type": "workflow",
+        "name": "my-app-agent-run"
+      }
     },
     "secrets": ["DATABASE_URL"]
   },
