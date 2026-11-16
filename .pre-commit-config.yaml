@@ -1,0 +1,50 @@
+repos:
+  - repo: builtin
+    hooks:
+      - id: no-commit-to-branch
+        args: [--branch, main]
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-added-large-files
+        exclude: ^apps/web/worker-configuration\.d\.ts$
+      - id: check-yaml
+      - id: check-toml
+      - id: detect-private-key
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e # frozen: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: biome
+        name: biome check
+        entry: pnpm exec biome check
+        args: [--diagnostic-level=error, --no-errors-on-unmatched, --files-ignore-unknown=true]
+        language: system
+        types_or: [javascript, jsx, ts, tsx, json, css]
+
+  - repo: https://github.com/jdx/jactionlint
+    rev: 9e87e8f34edfc00b849a27807e26eff9d00b936d # frozen: v2.5.0
+    hooks:
+      - id: jactionlint
+
+  # Kit-owned scripts stay byte-identical to upstream (decisions/2026-11-13-pre-commit-hooks.md).
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: a6564f5d57444e123433a5c9af733e3975c77229 # frozen: v0.11.0.1-1
+    hooks:
+      - id: shellcheck
+        exclude: &kit_scripts |-
+          (?x)^(
+            scripts/bootstrap\.sh|
+            apps/web/scripts/cf-provision\.sh|
+            apps/web/docker/neon-proxy-start\.sh
+          )$
+
+  - repo: https://github.com/scop/pre-commit-shfmt
+    rev: 479be5958357ba5ab65ce47172117348516860e9 # frozen: v3.14.1-1
+    hooks:
+      - id: shfmt
+        args: [-i, '2', -bn, -ci, -sr, -w]
+        exclude: *kit_scripts

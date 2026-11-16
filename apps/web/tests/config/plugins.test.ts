@@ -1,0 +1,1049 @@
+/**
+ * The "well-formed plugin" suite.
+ *
+ * The division of labour: **a plugin tests its behaviour; the host tests that it is a well-formed
+ * plugin.** A plugin's own tests live inside its directory and run in this same suite once it is
+ * installed. What this file checks is the handful of properties the HOST depends on and which no
+ * plugin author can verify for the combination of plugins a particular app has installed:
+ *
+ *   - ids are namespaces, so two plugins cannot collide and the kit is never one of them;
+ *   - query-key roots carry the plugin's id, so one plugin's invalidation cannot wipe another's;
+ *   - nothing reaches INTO a plugin except through its published entries, so a plugin's semver
+ *     means something;
+ *   - a plugin's `ui.ts` imports nothing heavy and reaches its pages only through `lazy()`, so
+ *     installing a plugin cannot quietly move its pages into the main bundle;
+ *   - the closed sets a plugin opens are still OPEN at the type level (the `expectTypeOf` block at
+ *     the end), which is the one property no runtime assertion can reach.
+ *
+ * Every check is a pure function over strings, exercised here with fixtures AND run over whatever
+ * is installed. With no plugins installed the second half is vacuous — which is why the fixtures
+ * are not optional: they are what keeps this suite meaningful in the kit itself.
+ */
+import { execFileSync } from 'node:child_process'
+import { existsSync, readFileSync } from 'node:fs'
+import path from 'node:path'
+import type { AgentKey, CORE_AGENT_KEYS } from '@my-app/shared/ai/agents'
+import type { CoreJobType, JobOf, JobType } from '@my-app/shared/jobs'
+import type { Subjects } from '@my-app/shared/permissions'
+import {
+  type AgentKeyOf,
+  type EventNameOf,
+  type EventPayloadOf,
+  type FeatureKeyOf,
+  isPluginId,
+  type JobTypeOf,
+  type SharedPlugin,
+} from '@my-app/shared/plugins'
+import { describe, expect, expectTypeOf, it } from 'vitest'
+import { z } from 'zod'
+import {
+  loginMethodIssue,
+  type PluginLoginMethodDeclaration,
+  pluginLoginMethods,
+} from '@/api/auth/plugin-login-methods'
+import {
+  evaluateSsoPolicy,
+  evaluateSsoPolicyForAll,
+  ssoAllows,
+  ssoRequiredLoginPath,
+} from '@/api/auth/sso-policy'
+import { MAX_PUBLIC_MOUNT_BODY_BYTES } from '@/api/middleware/body-limit'
+import { AGENTS } from '@/api/services/agents/registry'
+import { APP_EVENT_HANDLERS } from '@/api/services/events/app-handlers'
+import { loadConfig } from '@/config'
+import type { Database } from '@/db/client'
+import { SERVER_PLUGINS, serverPlugins } from '@/plugins/server'
+import { UI_PLUGINS, uiPlugins } from '@/plugins/ui'
+import { queryKeys } from '@/ui/lib/query-keys'
+import {
+  DECLARED_ENTRIES,
+  deepImportIssue,
+  emailHandlerIssues,
+  eventDeclarationIssues,
+  headerItemIssues,
+  isPluginEntry,
+  isPluginFile,
+  PLUGIN_IMPORT_ENFORCEMENT,
+  pluginIdOfPath,
+  pluginImportIssue,
+  publicMountIssues,
+  publicMountOptionIssues,
+  publicSiteClaims,
+  publicSiteIssues,
+  queryKeyRootIssues,
+  RESERVED_PLUGIN_IDS,
+  staticImports,
+  uiEntryIssues,
+  uploadPathIssues,
+} from '../helpers/plugins'
+import { createTestEnv } from '../mocks/bindings'
+
+const REPO_ROOT = path.resolve(__dirname, '../../../..')
+
+// ---- the helpers, against fixtures --------------------------------------------------------------
+
+describe('plugin ids', () => {
+  it('are a namespace, and never the kit', () => {
+    expect(isPluginId('analytics')).toBe(true)
+    expect(isPluginId('example-feature')).toBe(true)
+    expect(isPluginId('Analytics')).toBe(false)
+    expect(isPluginId('2fa')).toBe(false)
+    expect(isPluginId('my_plugin')).toBe(false)
+    // The rename translates a copy of the kit into somebody's app; an id carrying the kit's name
+    // would be rewritten with everything else, and the barrel line would stop resolving.
+    expect(isPluginId('my-app-extras')).toBe(false)
+  })
+})
+
+describe('query-key roots', () => {
+  it('must carry the plugin id, so one plugin cannot invalidate another', () => {
+    expect(queryKeyRootIssues('orders', ['orders:list', 'orders:detail'])).toEqual([])
+    expect(queryKeyRootIssues('orders', ['orders'])).toHaveLength(1)
+    expect(queryKeyRootIssues('orders', ['documents'])).toHaveLength(1)
+  })
+})
+
+describe('header items', () => {
+  it('are unique per plugin, kebab-case, placed center or end, with a finite order', () => {
+    expect(
+      headerItemIssues('search', [
+        { id: 'trigger', placement: 'center', order: -1 },
+        { id: 'help' },
+      ])
+    ).toEqual([])
+    expect(headerItemIssues('search', [{ id: 'a' }, { id: 'a' }])).toHaveLength(1)
+    expect(headerItemIssues('search', [{ id: 'Bad id' }])).toHaveLength(1)
+    expect(headerItemIssues('search', [{ id: 'x', placement: 'start' }])).toHaveLength(1)
+    expect(headerItemIssues('search', [{ id: 'x', order: Number.NaN }])).toHaveLength(1)
+    expect(uiPlugins.flatMap(p => headerItemIssues(p.shared.id, p.header ?? []))).toEqual([])
+  })
+})
+
+describe('public mounts', () => {
+  it('live under /api/hooks/<id> and nowhere else', () => {
+    expect(publicMountIssues('orders', ['/api/hooks/orders'], ['/api/orders'])).toEqual([])
+    expect(publicMountIssues('orders', ['/api/hooks/orders/stripe'], [])).toEqual([])
+    expect(publicMountIssues('orders', ['/api/orders/webhook'], [])).toHaveLength(1)
+    // Another plugin's slot, and a prefix that merely starts with the id, are both refused.
+    expect(publicMountIssues('orders', ['/api/hooks/billing'], [])).toHaveLength(1)
+    expect(publicMountIssues('orders', ['/api/hooks/orders-x'], [])).toHaveLength(1)
+  })
+
+  it('never share /api/hooks with an authed mount', () => {
+    expect(publicMountIssues('orders', [], ['/api/hooks/orders'])[0]).toMatch(
+      /public by definition/
+    )
+    expect(publicMountIssues('orders', [], ['/api/hooks'])).toHaveLength(1)
+  })
+
+  it('declare guards the host can enforce, and never an unbounded body', () => {
+    const at = '/api/hooks/orders'
+    expect(publicMountOptionIssues('orders', at, undefined)).toEqual([])
+    expect(publicMountOptionIssues('orders', at, { rateLimit: false })).toEqual([])
+    expect(
+      publicMountOptionIssues('orders', at, {
+        rateLimit: { max: 600, windowSeconds: 60 },
+        bodyLimitBytes: MAX_PUBLIC_MOUNT_BODY_BYTES,
+      })
+    ).toEqual([])
+    expect(
+      publicMountOptionIssues('orders', at, { rateLimit: { max: 0, windowSeconds: 60 } })
+    ).toHaveLength(1)
+    expect(
+      publicMountOptionIssues('orders', at, { rateLimit: { max: 10, windowSeconds: 0.5 } })
+    ).toHaveLength(1)
+    expect(
+      publicMountOptionIssues('orders', at, { bodyLimitBytes: MAX_PUBLIC_MOUNT_BODY_BYTES + 1 })[0]
+    ).toMatch(/exceeds/)
+    expect(publicMountOptionIssues('orders', at, { bodyLimitBytes: 0 })).toHaveLength(1)
+    expect(publicMountOptionIssues('orders', at, { bodyLimitBytes: 1.5 })).toHaveLength(1)
+  })
+})
+
+describe('public sites', () => {
+  const site = { id: 'sites', hosts: ['www.example.com'] }
+
+  it('accepts a well-formed claim, a dormant one and a local one', () => {
+    expect(
+      publicSiteIssues([
+        {
+          ...site,
+          forms: [{ path: '/forms/contact', bodyLimitBytes: 1024 }],
+          csp: [{ scriptSrc: ['https://plausible.io'], formAction: ["'self'"] }],
+        },
+      ])
+    ).toEqual([])
+    expect(publicSiteIssues([{ id: 'sites', hosts: null }])).toEqual([])
+    expect(publicSiteIssues([{ id: 'sites', hosts: ['www.localhost'] }])).toEqual([])
+  })
+
+  it.each([
+    'WWW.example.com',
+    'www.example.com:8080',
+    'https://www.example.com',
+    'www.example.com/',
+    '*.example.com',
+    '',
+  ])('refuses the malformed host %j', host => {
+    expect(publicSiteIssues([{ id: 'sites', hosts: [host] }])[0]).toMatch(/must be lowercase/)
+  })
+
+  it('refuses a host claimed twice, or the app host', () => {
+    expect(publicSiteIssues([site, { id: 'other', hosts: ['www.example.com'] }])[0]).toMatch(
+      /already claimed by sites/
+    )
+    expect(publicSiteIssues([site], 'www.example.com')[0]).toMatch(/app's own host/)
+  })
+
+  it('refuses a form path that is not exact and absolute, or a limit over the max', () => {
+    for (const path of ['forms/contact', '//forms', '/forms?x=1', '/forms/:id', '/forms/*']) {
+      expect(publicSiteIssues([{ ...site, forms: [{ path }] }])[0]).toMatch(/exact absolute path/)
+    }
+    const tooBig = { path: '/forms/contact', bodyLimitBytes: MAX_PUBLIC_MOUNT_BODY_BYTES + 1 }
+    expect(publicSiteIssues([{ ...site, forms: [tooBig] }])[0]).toMatch(/bodyLimitBytes/)
+    expect(
+      publicSiteIssues([
+        { ...site, forms: [{ path: '/f', rateLimit: { max: 0, windowSeconds: 60 } }] },
+      ])
+    ).toHaveLength(1)
+  })
+
+  it.each([
+    "'unsafe-inline'",
+    "'UNSAFE-EVAL'",
+    "'unsafe-hashes'",
+    "'sha256-abc'",
+    "'nonce-abc'",
+    '*',
+    'https://*.example.com',
+    'data:',
+    'https://a.example; script-src *',
+    'https://a.example https://b.example',
+  ])('refuses the CSP source %j', source => {
+    expect(publicSiteIssues([{ ...site, csp: [{ scriptSrc: [source] }] }])[0]).toMatch(/forbidden/)
+  })
+
+  it.each([
+    "'self'",
+    'https:',
+    'www.example.com',
+    'https://www.example.com',
+    'https://www.example.com/',
+    'https://www.example.com/assets/',
+    'https://www.example.com/assets/main.js',
+    'https://WWW.example.com:8443/assets/',
+  ])('refuses the script source %j, which reaches the admin bundle', source => {
+    expect(publicSiteIssues([{ ...site, csp: [{ scriptSrc: [source] }] }])[0]).toMatch(
+      /admin bundle/
+    )
+  })
+
+  it.each([
+    'https://www.example.com/site-assets/',
+    'https://www.example.com/js/app.js',
+    'https://other.example.com/assets/',
+    'https://plausible.io',
+  ])('accepts the script source %j', source => {
+    expect(publicSiteIssues([{ ...site, csp: [{ scriptSrc: [source] }] }])).toEqual([])
+  })
+
+  it('checks every directive', () => {
+    expect(publicSiteIssues([{ ...site, csp: [{ frameSrc: ['*'] }] }])).toHaveLength(1)
+    expect(publicSiteIssues([{ ...site, csp: [{ imgSrc: ['data:'] }] }])).toHaveLength(1)
+    expect(publicSiteIssues([{ ...site, csp: [{ connectSrc: ['*'] }] }])).toHaveLength(1)
+    expect(publicSiteIssues([{ ...site, csp: [{ formAction: ['*'] }] }])).toHaveLength(1)
+  })
+})
+
+describe('plugin events (D42)', () => {
+  const declared = [
+    { id: 'sites', events: ['sites.form.submitted', 'sites.page.published'] },
+    { id: 'crm', events: ['crm.lead.created'] },
+  ]
+
+  it('accepts namespaced names, and subscriptions to them', () => {
+    expect(
+      eventDeclarationIssues({
+        declared,
+        handlers: [
+          { owner: 'crm', event: 'sites.form.submitted', name: 'make-lead' },
+          { owner: 'app', event: 'crm.lead.created', name: 'notify-sales' },
+        ],
+        agentEvents: [{ agentKey: 'crm.qualify', event: 'sites.form.submitted', kind: 'trigger' }],
+      })
+    ).toEqual([])
+  })
+
+  it('refuses a mis-prefixed, a kit. and a malformed name, and one declared twice', () => {
+    expect(
+      eventDeclarationIssues({
+        declared: [
+          ...declared,
+          { id: 'kit', events: ['kit.agent.started'] },
+          { id: 'crm', events: ['sites.form.submitted', 'crm.Lead', 'crm'] },
+        ],
+        handlers: [],
+        agentEvents: [],
+      })
+    ).toEqual([
+      "kit: event 'kit.agent.started' is in the core kit. namespace",
+      "crm: event 'sites.form.submitted' must start with 'crm.'",
+      "crm: event 'sites.form.submitted' is already declared by sites",
+      "crm: event 'crm.Lead' must be lower-case dot-separated segments after 'crm.'",
+      "crm: event 'crm' must start with 'crm.'",
+    ])
+  })
+
+  it('refuses a handler, trigger or binding on an undeclared event, and a bad or doubled name', () => {
+    expect(
+      eventDeclarationIssues({
+        declared,
+        handlers: [
+          { owner: 'crm', event: 'sites.form.sent', name: 'make-lead' },
+          { owner: 'crm', event: 'sites.form.submitted', name: 'make-lead' },
+          { owner: 'app', event: 'crm.lead.created', name: 'Notify Sales' },
+        ],
+        agentEvents: [{ agentKey: 'crm.qualify', event: 'crm.lead.made', kind: 'bindable' }],
+      })
+    ).toEqual([
+      "crm: handler 'make-lead' subscribes to undeclared event 'sites.form.sent'",
+      "crm: handler name 'make-lead' is used twice",
+      "app: handler name 'Notify Sales' must match ^[a-z][a-z0-9-]*$",
+      "agent crm.qualify: bindable names undeclared event 'crm.lead.made'",
+    ])
+  })
+})
+
+describe('login methods', () => {
+  const method = (startPath: string, id = 'sso') => ({ id, label: 'SSO', startPath })
+
+  it('start under the plugin’s own /api/hooks/<id>/ and nowhere else', () => {
+    expect(loginMethodIssue('orders', method('/api/hooks/orders/sso/start'))).toBeNull()
+    for (const bad of [
+      '/auth/oidc',
+      '/api/orders/sso',
+      '/api/hooks/billing/sso',
+      '/api/hooks/orders-x/sso',
+      '/api/hooks/orders/',
+      '/api/hooks/orders',
+      '/api/hooks/orders/../billing/x',
+      '/api/hooks/orders/sso?next=/x',
+      'https://evil.example/api/hooks/orders/sso',
+    ]) {
+      expect(loginMethodIssue('orders', method(bad)), bad).not.toBeNull()
+    }
+    expect(loginMethodIssue('orders', method('/api/hooks/orders/sso', 'Bad Id'))).not.toBeNull()
+  })
+
+  it('declare error copy only for their own <id>.<name> codes', () => {
+    const at = '/api/hooks/orders/sso'
+    const withErrors = (errors: Record<string, string>) => ({ ...method(at), errors })
+    expect(loginMethodIssue('orders', withErrors({ 'orders.not_ready': 'Not yet.' }))).toBeNull()
+    for (const code of [
+      'not_ready',
+      'sso_required',
+      'billing.not_ready',
+      'orders-x.not_ready',
+      'orders.',
+      'orders.Not-Ready',
+      'orders.a.b',
+    ]) {
+      expect(loginMethodIssue('orders', withErrors({ [code]: 'x' })), code).not.toBeNull()
+    }
+    expect(loginMethodIssue('orders', withErrors({ 'orders.x': '' }))).not.toBeNull()
+    expect(loginMethodIssue('orders', withErrors({ 'orders.x': 'y'.repeat(301) }))).not.toBeNull()
+  })
+
+  it('are dropped at runtime when stray, and namespaced on the wire', () => {
+    const cfg = loadConfig(createTestEnv())
+    const fixture = [
+      {
+        shared: { id: 'orders' },
+        loginMethods: (): PluginLoginMethodDeclaration[] => [
+          { ...method('/api/hooks/orders/sso'), errors: { 'orders.not_ready': 'Not yet.' } },
+          method('/auth/oidc', 'stray'),
+          { ...method('/api/hooks/orders/x', 'kit-copy'), errors: { sso_required: 'Reworded.' } },
+        ],
+      },
+      {
+        shared: { id: 'broken' },
+        loginMethods: () => {
+          throw new Error('boom')
+        },
+      },
+    ]
+    expect(pluginLoginMethods(fixture, cfg)).toEqual([
+      {
+        id: 'orders:sso',
+        label: 'SSO',
+        startPath: '/api/hooks/orders/sso',
+        errors: { 'orders.not_ready': 'Not yet.' },
+      },
+    ])
+  })
+
+  it('every installed plugin’s, in every APP_ENV, start under its own hooks prefix', () => {
+    const issues = (['development', 'staging', 'production'] as const).flatMap(APP_ENV => {
+      const cfg = loadConfig(createTestEnv({ APP_ENV }))
+      return serverPlugins.flatMap(p =>
+        (p.loginMethods?.(cfg) ?? []).map(m => loginMethodIssue(p.shared.id, m)).filter(Boolean)
+      )
+    })
+    expect(issues).toEqual([])
+  })
+})
+
+describe('sso policy', () => {
+  // The policy receives the db opaquely; these fixtures never touch it.
+  const db = {} as Database
+  const cfg = loadConfig(createTestEnv({ BOOTSTRAP_ADMIN_EMAILS: 'root@acme.test' }))
+  const sso = { id: 'sso', label: 'Acme SSO', startPath: '/api/hooks/acme/sso' }
+  const silent = { warn: () => {}, error: () => {} }
+  const claims = (domain: string, methodId = 'sso') => ({
+    shared: { id: 'acme' },
+    loginMethods: () => [sso],
+    ssoPolicy: async (_db: Database, email: string) =>
+      email.endsWith(`@${domain}`) ? { required: true as const, methodId, label: 'Acme' } : null,
+  })
+  const other = { shared: { id: 'other' }, ssoPolicy: async () => null }
+  const throws = {
+    shared: { id: 'broken' },
+    ssoPolicy: async () => {
+      throw new Error('connection table missing')
+    },
+  }
+
+  it('a claimed domain is required, routed to the namespaced method; anything else is not', async () => {
+    const plugins = [other, claims('acme.test')]
+    const decision = await evaluateSsoPolicy(plugins, db, cfg, 'Jane@ACME.test', silent)
+    expect(decision).toEqual({
+      required: true,
+      claims: [{ pluginId: 'acme', method: 'acme:sso', label: 'Acme' }],
+      method: 'acme:sso',
+      label: 'Acme',
+    })
+    expect(await evaluateSsoPolicy(plugins, db, cfg, 'jane@elsewhere.test', silent)).toEqual({
+      required: false,
+    })
+    expect(await evaluateSsoPolicy([], db, cfg, 'jane@acme.test')).toEqual({ required: false })
+  })
+
+  it('refuses every kit method and every OTHER plugin; lets the claiming plugin through', async () => {
+    const decision = await evaluateSsoPolicy([claims('acme.test')], db, cfg, 'j@acme.test')
+    expect(ssoAllows(decision, 'core')).toBe(false)
+    expect(ssoAllows(decision, { pluginId: 'other' })).toBe(false)
+    expect(ssoAllows(decision, { pluginId: 'acme' })).toBe(true)
+    const open = await evaluateSsoPolicy([claims('acme.test')], db, cfg, 'j@x.test')
+    expect(ssoAllows(open, 'core')).toBe(true)
+  })
+
+  const onConnection = (domain: string, connectionId: string) => ({
+    shared: { id: 'acme' },
+    loginMethods: () => [sso],
+    ssoPolicy: async (_db: Database, email: string) =>
+      email.endsWith(`@${domain}`)
+        ? { required: true as const, methodId: 'sso', connectionId }
+        : null,
+  })
+
+  it('a claim that names a connection is satisfied only by a sign-in through that connection', async () => {
+    const decision = await evaluateSsoPolicy(
+      [onConnection('acme.test', 'conn-a')],
+      db,
+      cfg,
+      'j@acme.test'
+    )
+    expect(ssoAllows(decision, { pluginId: 'acme', connectionId: 'conn-a' })).toBe(true)
+    expect(ssoAllows(decision, { pluginId: 'acme', connectionId: 'conn-b' })).toBe(false)
+    expect(ssoAllows(decision, { pluginId: 'acme' })).toBe(false)
+  })
+
+  it('every address of the sign-in must be claimed by the connection signing in', async () => {
+    const plugins = [
+      onConnection('a.test', 'conn-a'),
+      { ...onConnection('b.test', 'conn-b'), shared: { id: 'acme' } },
+    ]
+    const both = await evaluateSsoPolicyForAll(plugins, db, cfg, ['j@a.test', 'j@b.test'], silent)
+    expect(ssoAllows(both, { pluginId: 'acme', connectionId: 'conn-a' })).toBe(false)
+    expect(ssoAllows(both, { pluginId: 'acme', connectionId: 'conn-b' })).toBe(false)
+    const one = await evaluateSsoPolicyForAll(plugins, db, cfg, ['j@a.test'], silent)
+    expect(ssoAllows(one, { pluginId: 'acme', connectionId: 'conn-a' })).toBe(true)
+  })
+
+  it('a policy that throws fails closed for that email, attributed to the plugin that threw', async () => {
+    const errors: unknown[] = []
+    const decision = await evaluateSsoPolicy([throws], db, cfg, 'j@x.test', {
+      warn: () => {},
+      error: (...args: unknown[]) => errors.push(args),
+    })
+    expect(decision).toEqual({
+      required: true,
+      claims: [{ pluginId: 'broken', method: null, failed: true }],
+      method: null,
+    })
+    expect(errors).toHaveLength(1)
+    expect(ssoAllows(decision, 'core')).toBe(false)
+    expect(ssoAllows(decision, { pluginId: 'acme' })).toBe(false)
+    // A plugin's own IdP is not blocked by its own failure to answer.
+    expect(ssoAllows(decision, { pluginId: 'broken' })).toBe(true)
+  })
+
+  it('a malformed answer also fails closed; an undeclared method keeps the rule and drops the hint', async () => {
+    const malformed = { shared: { id: 'odd' }, ssoPolicy: async () => ({ required: 'yes' }) }
+    // biome-ignore lint/suspicious/noExplicitAny: a plugin answering outside its type is the case
+    const bad = await evaluateSsoPolicy([malformed as any], db, cfg, 'j@x.test', silent)
+    expect(bad).toMatchObject({ required: true, method: null })
+    const undeclared = await evaluateSsoPolicy(
+      [claims('acme.test', 'nope')],
+      db,
+      cfg,
+      'j@acme.test',
+      silent
+    )
+    expect(undeclared).toMatchObject({ required: true, method: null })
+  })
+
+  it('BOOTSTRAP_ADMIN_EMAILS are exempt (break-glass), even from a throwing policy', async () => {
+    const plugins = [claims('acme.test'), throws]
+    expect(await evaluateSsoPolicy(plugins, db, cfg, 'ROOT@acme.test', silent)).toEqual({
+      required: false,
+      bypassed: 'bootstrap_admin',
+    })
+  })
+
+  it('checks every distinct address of a sign-in once each', async () => {
+    let calls = 0
+    const counting = {
+      ...claims('acme.test'),
+      ssoPolicy: async (d: Database, e: string) => {
+        calls++
+        return claims('acme.test').ssoPolicy(d, e)
+      },
+    }
+    const linked = await evaluateSsoPolicyForAll(
+      [counting],
+      db,
+      cfg,
+      ['jane@gmail.test', 'JANE@acme.test', null, 'jane@gmail.test'],
+      silent
+    )
+    expect(calls).toBe(2)
+    expect(linked).toMatchObject({ required: true, method: 'acme:sso' })
+  })
+
+  it('redirects to /login with the method and never the label', async () => {
+    const decision = await evaluateSsoPolicy([claims('acme.test')], db, cfg, 'j@acme.test')
+    expect(ssoRequiredLoginPath(decision, { returnUrl: '/invite/abc' })).toBe(
+      '/login?error=sso_required&method=acme%3Asso&returnUrl=%2Finvite%2Fabc'
+    )
+    expect(ssoRequiredLoginPath({ required: false }, { returnUrl: '/' })).toBe(
+      '/login?error=sso_required'
+    )
+  })
+
+  it('every installed plugin’s policy names one of its own login methods, in development', async () => {
+    const dev = loadConfig(createTestEnv({ APP_ENV: 'development' }))
+    for (const plugin of serverPlugins) {
+      if (!plugin.ssoPolicy) continue
+      const declared = new Set((plugin.loginMethods?.(dev) ?? []).map(m => m.id))
+      // The reference plugin's probe address; a real plugin's policy answers null for it.
+      const answer = await plugin.ssoPolicy(db, 'probe@sso-required.example.test', { config: dev })
+      if (answer) expect(declared, plugin.shared.id).toContain(answer.methodId)
+    }
+  })
+})
+
+describe('the plugin boundary', () => {
+  it('reads a path as belonging to a plugin, and a barrel as belonging to none', () => {
+    expect(pluginIdOfPath('apps/web/src/plugins/orders/api/routes.ts')).toBe('orders')
+    expect(pluginIdOfPath('packages/shared/src/plugins/orders/index.ts')).toBe('orders')
+    expect(pluginIdOfPath('apps/web/src/plugins/server.ts')).toBeNull()
+    // The sixth barrel, added with worker-exports: without it this file reads as a plugin
+    // called 'worker-exports', and its own line reads as a deep import into one.
+    expect(pluginIdOfPath('apps/web/src/plugins/worker-exports.ts')).toBeNull()
+    // An import specifier carries no extension, which is the spelling that used to read as a plugin
+    // called "index".
+    expect(pluginIdOfPath('packages/shared/src/plugins/index')).toBeNull()
+    expect(pluginIdOfPath('apps/web/src/api/index.ts')).toBeNull()
+  })
+
+  it('knows the four published entries', () => {
+    expect(isPluginEntry('apps/web/src/plugins/orders/index.ts')).toBe(true)
+    expect(isPluginEntry('apps/web/src/plugins/orders/ui/index.ts')).toBe(true)
+    expect(isPluginEntry('packages/shared/src/plugins/orders/index.ts')).toBe(true)
+    expect(isPluginEntry('apps/cli/src/plugins/orders/index.ts')).toBe(true)
+    expect(isPluginEntry('apps/web/src/plugins/orders/ui/pages/List.tsx')).toBe(false)
+  })
+
+  it('refuses a deep import from core, and from another plugin', () => {
+    expect(
+      deepImportIssue('apps/web/src/ui/pages/Home.tsx', '@/plugins/orders/ui/pages/List')
+    ).toMatch(/reach a plugin only through its entry/)
+    expect(
+      deepImportIssue('apps/web/src/plugins/billing/api/routes.ts', '../../orders/api/service')
+    ).toMatch(/orders/)
+  })
+
+  it('allows a plugin its own files, the entries, and the barrel lines', () => {
+    expect(deepImportIssue('apps/web/src/plugins/orders/api/routes.ts', './service')).toBeNull()
+    expect(deepImportIssue('apps/web/src/api/index.ts', '@/plugins/orders')).toBeNull()
+    expect(deepImportIssue('apps/web/src/ui/App.tsx', '@/plugins/orders/ui')).toBeNull()
+    // The schema barrel names a plugin's inner file by design — that line IS the installation.
+    expect(deepImportIssue('apps/web/src/plugins/schema.ts', './orders/db/schema')).toBeNull()
+    expect(
+      deepImportIssue('apps/web/src/plugins/worker-exports.ts', './orders/worker-exports')
+    ).toBeNull()
+  })
+})
+
+describe('a plugin UI entry', () => {
+  const good = `
+    import { lazy } from 'react'
+    import { CubeIcon } from '@heroicons/react/24/outline'
+    import { ordersShared } from '@my-app/shared/plugins/orders/index'
+    import type { UiPlugin } from '@/plugins/types'
+    const OrdersPage = lazy(() => import('./pages/OrdersPage'))
+    export const ordersUi: UiPlugin = { shared: ordersShared, routes: [{ path: '/orders', Component: OrdersPage }] }
+  `
+
+  it('passes when it only wires things up', () => {
+    expect(uiEntryIssues('ui.ts', good)).toEqual([])
+  })
+
+  it('catches a page imported statically — the whole reason for the rule', () => {
+    const bad = good.replace(
+      "const OrdersPage = lazy(() => import('./pages/OrdersPage'))",
+      "import OrdersPage from './pages/OrdersPage'"
+    )
+    expect(uiEntryIssues('ui.ts', bad)).toHaveLength(1)
+    expect(uiEntryIssues('ui.ts', bad)[0]).toMatch(/main bundle/)
+  })
+
+  it('catches a dynamic import that is not a lazy component', () => {
+    const bad = `${good}\nconst mod = await import('./pages/Other')`
+    expect(uiEntryIssues('ui.ts', bad).join()).toMatch(/lazy\(\(\) => import/)
+  })
+
+  it('catches a heavy dependency, and lets a type-only import of one through', () => {
+    expect(uiEntryIssues('ui.ts', `import { Chart } from 'recharts'\n${good}`)).toHaveLength(1)
+    expect(uiEntryIssues('ui.ts', `import type { Chart } from 'recharts'\n${good}`)).toEqual([])
+  })
+})
+
+describe('the plugin import rule', () => {
+  const ROUTE = 'apps/web/src/plugins/orders/api/routes.ts'
+  const TABLE = 'apps/web/src/plugins/orders/db/schema/orders.ts'
+
+  it('names entries that all exist on disk', () => {
+    // Vacuous the day an entry is renamed: the rule would then pass everything it used to catch.
+    for (const entry of DECLARED_ENTRIES) {
+      const candidates = [`${entry}.ts`, `${entry}/index.ts`, entry]
+      expect(
+        candidates.some(c => existsSync(path.join(REPO_ROOT, c))),
+        entry
+      ).toBe(true)
+    }
+  })
+
+  it('passes a declared entry, in every spelling', () => {
+    expect(pluginImportIssue(ROUTE, '@/plugins/api')).toBeNull()
+    expect(pluginImportIssue(ROUTE, '@/plugins/types')).toBeNull()
+    // The schema kit is reached relatively from a table file, which is how a plugin's own tree
+    // spells it — four levels out of `plugins/<id>/db/schema`.
+    expect(pluginImportIssue(TABLE, '../../../../db/schema/kit')).toBeNull()
+    expect(pluginImportIssue(ROUTE, '@my-app/shared/plugins/orders/index')).toBeNull()
+    expect(pluginImportIssue(ROUTE, '@my-app/shared/pagination')).toBeNull()
+    expect(
+      pluginImportIssue('apps/web/src/plugins/orders/ui/index.ts', '@/plugins/api/ui-wiring')
+    ).toBeNull()
+    expect(pluginImportIssue('apps/cli/src/plugins/orders/index.ts', '../api')).toBeNull()
+  })
+
+  it('leaves third-party packages and the plugin’s own files alone', () => {
+    // The rule is about coupling to kit INTERNALS, not about dependencies.
+    expect(pluginImportIssue(ROUTE, 'zod')).toBeNull()
+    expect(pluginImportIssue(ROUTE, 'drizzle-orm')).toBeNull()
+    expect(pluginImportIssue(ROUTE, 'react')).toBeNull()
+    expect(pluginImportIssue(ROUTE, './service')).toBeNull()
+    expect(pluginImportIssue(ROUTE, '../shared')).toBeNull()
+  })
+
+  it('lets a plugin import its OWN host files, @/host/<id>/…, and no other plugin’s', () => {
+    // `hostFiles` seeds `apps/web/src/host/<id>/` for the developer; the plugin reads it back.
+    expect(pluginImportIssue(ROUTE, '@/host/orders/content.generated')).toBeNull()
+    expect(
+      pluginImportIssue('apps/web/src/plugins/orders/ui/pages/Guide.tsx', '@/host/orders/a/b')
+    ).toBeNull()
+    expect(pluginImportIssue(ROUTE, '../../../host/orders/content.generated')).toBeNull()
+    expect(pluginImportIssue(ROUTE, '@/host/billing/content.generated', 3)).toBe(
+      "routes.ts:3 imports '@/host/billing/content.generated' — a plugin imports only its own host files, '@/host/orders/…'"
+    )
+    expect(pluginImportIssue(ROUTE, '@/host')).not.toBeNull()
+  })
+
+  it('says nothing about a core file — this guards ONE direction', () => {
+    // `deepImportIssue` owns core→plugin and plugin→plugin; this owns plugin→core.
+    expect(pluginImportIssue('apps/web/src/api/index.ts', '@/api/services/jobs')).toBeNull()
+  })
+
+  it('refuses a kit internal, and the message carries the EDIT', () => {
+    // The whole point: an install is performed by an agent, and a diagnostic that says only what
+    // is wrong gives one nothing to do.
+    expect(pluginImportIssue(TABLE, '../../../../db/schema/rls', 4)).toBe(
+      "orders.ts:4 imports '../../../../db/schema/rls' — replace with: " +
+        "import { tenantIsolation } from '@/db/schema/kit'"
+    )
+    expect(pluginImportIssue(ROUTE, '@/api/services/jobs', 9)).toMatch(/ctx\.enqueue\(input\)/)
+    expect(pluginImportIssue(ROUTE, '@/api/utils/routes/route-helpers')).toMatch(/requestCtx\(c\)/)
+    expect(pluginImportIssue(ROUTE, '@/api/middleware/permissions')).toMatch(/ctx\.guard/)
+    expect(pluginImportIssue(ROUTE, '@/api/utils/core/errors')).toMatch(/ctx\.notFound/)
+    expect(
+      pluginImportIssue('apps/web/src/plugins/orders/ui/pages/List.tsx', '@/ui/components/shared')
+    ).toMatch(/@\/plugins\/api\/ui/)
+  })
+
+  it('falls back to naming the entry when it has no better suggestion', () => {
+    expect(pluginImportIssue(ROUTE, '@/api/routes/members')).toMatch(/'@\/plugins\/api'/)
+  })
+
+  it('covers a plugin’s tests as well as its source', () => {
+    const TEST = 'apps/web/src/plugins/orders/tests/api/orders.test.ts'
+    expect(isPluginFile(ROUTE)).toBe(true)
+    expect(isPluginFile(TEST)).toBe(true)
+    expect(isPluginFile('apps/web/src/api/index.ts')).toBe(false)
+
+    // The climb into the host's test tree is what `@testkit` replaced — and the diagnostic names
+    // the entry rather than only the offence.
+    // Five levels out of `plugins/<id>/tests/api` is `apps/web/`, which is how a plugin's test
+    // actually spelled the climb before `@testkit` existed.
+    expect(pluginImportIssue(TEST, '../../../../../tests/mocks/bindings', 7)).toBe(
+      "orders.test.ts:7 imports '../../../../../tests/mocks/bindings' — replace with: " +
+        "import { createTestEnv, stubs } from '@testkit/integration'"
+    )
+    expect(pluginImportIssue(TEST, '../../../../../tests/helpers/db')).toMatch(/setupTestDatabase/)
+    expect(pluginImportIssue(TEST, '@testkit/integration')).toBeNull()
+    expect(pluginImportIssue(TEST, '@testkit/unit')).toBeNull()
+  })
+})
+
+// ---- the same helpers, against what is actually installed ----------------------------------------
+
+const tracked = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard'], {
+  cwd: REPO_ROOT,
+  encoding: 'utf8',
+})
+  .trim()
+  .split('\n')
+  .filter(f => /\.tsx?$/.test(f))
+  // `git ls-files` reads the INDEX, so a file deleted on disk and not yet staged is still listed.
+  // `pnpm plugin remove --apply` deletes three directories and the gate runs BEFORE any `git add`,
+  // so without this filter the scan dies with ENOENT on a file the tool correctly removed.
+  .filter(f => existsSync(path.join(REPO_ROOT, f)))
+
+describe('installed plugins', () => {
+  it('the barrels agree on what is installed', () => {
+    // A plugin may ship only a UI half or only a server half, so these are not equal sets — but an
+    // id in either barrel must be a legal id, and must appear at most once in each.
+    for (const barrel of [serverPlugins, uiPlugins]) {
+      const ids = barrel.map(p => p.shared.id)
+      expect(new Set(ids).size, ids.join(', ')).toBe(ids.length)
+      for (const id of ids) {
+        expect(isPluginId(id), id).toBe(true)
+        expect(RESERVED_PLUGIN_IDS.has(id), `${id} is a barrel filename`).toBe(false)
+      }
+    }
+    // The `as const` tuples and the widened lists are the same objects — A2 derives types from the
+    // tuples, so a barrel whose two exports drifted would typecheck and mean nothing.
+    expect(SERVER_PLUGINS.length).toBe(serverPlugins.length)
+    expect(UI_PLUGINS.length).toBe(uiPlugins.length)
+  })
+
+  it('declares no API prefix or mount that collides with another plugin', () => {
+    // Deduped WITHIN a plugin first, because both repetitions are normal and neither is a
+    // collision: a prefix outside `/api` has to appear in `mounts` (the router) AND in
+    // `apiPrefixes` (the SPA catch-all, the parity test, `run_worker_first`), and one router may be
+    // mounted at two prefixes — the analytics plugin's `/cubejs-api` and `/mcp` are both
+    // (drizzle-cube's adapter registers absolute paths). What must never happen is TWO plugins
+    // claiming one prefix, because Hono matches in registration order and the loser is invisible.
+    const claimed = serverPlugins.flatMap(p => [
+      ...new Set([
+        ...(p.apiPrefixes ?? []),
+        ...(p.mounts ?? []).map(m => m[0]),
+        ...(p.publicMounts ?? []).map(m => m[0]),
+      ]),
+    ])
+    expect(new Set(claimed).size, claimed.join(', ')).toBe(claimed.length)
+  })
+
+  it('mounts its public routes only under /api/hooks/<id>', () => {
+    const issues = serverPlugins.flatMap(p =>
+      publicMountIssues(
+        p.shared.id,
+        (p.publicMounts ?? []).map(m => m[0]),
+        (p.mounts ?? []).map(m => m[0])
+      )
+    )
+    expect(issues).toEqual([])
+  })
+
+  it('skips the body cap only beneath its own API prefix', () => {
+    expect(uploadPathIssues('orders', ['/api/orders/upload'])).toEqual([])
+    expect(uploadPathIssues('orders', ['/api/orders/'])).toHaveLength(1)
+    expect(uploadPathIssues('orders', ['/api/files'])).toHaveLength(1)
+    expect(uploadPathIssues('orders', ['/api/orders-x/upload'])).toHaveLength(1)
+    expect(serverPlugins.flatMap(p => uploadPathIssues(p.shared.id, p.uploadPaths ?? []))).toEqual(
+      []
+    )
+  })
+
+  it('declares public-mount guards within the host ceilings', () => {
+    const issues = serverPlugins.flatMap(p =>
+      (p.publicMounts ?? []).flatMap(([prefix, , options]) =>
+        publicMountOptionIssues(p.shared.id, prefix, options)
+      )
+    )
+    expect(issues).toEqual([])
+  })
+
+  it('claims only well-formed public site hosts, forms and CSP sources', () => {
+    const cfg = loadConfig(createTestEnv())
+    expect(
+      publicSiteIssues(publicSiteClaims(serverPlugins, cfg), new URL(cfg.APP_URL).hostname)
+    ).toEqual([])
+  })
+
+  it('claims each inbound email local part at most once', () => {
+    const issues = emailHandlerIssues(
+      serverPlugins.map(p => ({
+        id: p.shared.id,
+        localParts: (p.emailHandlers ?? []).map(h => h.localPart),
+      }))
+    )
+    expect(issues).toEqual([])
+    // The rule itself, on a fixture: a kit with no email plugin installed proves nothing above.
+    expect(
+      emailHandlerIssues([
+        { id: 'a', localParts: ['receipts', '*'] },
+        { id: 'b', localParts: ['receipts', 'Bills', 'x+y', '*'] },
+      ])
+    ).toEqual([
+      "b: email local part 'receipts' is already handled by a",
+      "b: email local part 'Bills' must be lower-case with no '+', '@' or space",
+      "b: email local part 'x+y' must be lower-case with no '+', '@' or space",
+      "b: email local part '*' is already handled by a",
+    ])
+  })
+
+  it('declares its events under its own id, once, and subscribes only to declared ones', () => {
+    const issues = eventDeclarationIssues({
+      declared: serverPlugins.map(p => ({
+        id: p.shared.id,
+        events: Object.keys(p.shared.events ?? {}),
+      })),
+      handlers: [
+        ...serverPlugins.flatMap(p =>
+          (p.eventHandlers ?? []).map(h => ({ owner: p.shared.id, event: h.event, name: h.name }))
+        ),
+        ...APP_EVENT_HANDLERS.map(h => ({ owner: 'app', event: h.event, name: h.name })),
+      ],
+      agentEvents: Object.values(AGENTS).flatMap(a => [
+        ...(a.triggers ?? []).map(t => ({
+          agentKey: a.meta.key,
+          event: t.event,
+          kind: 'trigger' as const,
+        })),
+        ...(a.bindable ?? []).map(b => ({
+          agentKey: a.meta.key,
+          event: b.event,
+          kind: 'bindable' as const,
+        })),
+      ]),
+    })
+    expect(issues).toEqual([])
+  })
+
+  it('lists in plugin.json "events" exactly the events its shared entry declares', () => {
+    for (const plugin of serverPlugins) {
+      const anchor = path.join(REPO_ROOT, `apps/web/src/plugins/${plugin.shared.id}/plugin.json`)
+      if (!existsSync(anchor)) continue
+      const manifest = JSON.parse(readFileSync(anchor, 'utf8')) as { events?: string[] }
+      expect([...(manifest.events ?? [])].sort(), plugin.shared.id).toEqual(
+        Object.keys(plugin.shared.events ?? {}).sort()
+      )
+    }
+  })
+
+  it('namespaces every query-key root it declares', () => {
+    const issues = uiPlugins.flatMap(p =>
+      queryKeyRootIssues(p.shared.id, Object.keys(p.queryKeys ?? {}))
+    )
+    expect(issues).toEqual([])
+  })
+
+  it('is never reached past its published entry', () => {
+    const issues: string[] = []
+    for (const file of tracked) {
+      const source = readFileSync(path.join(REPO_ROOT, file), 'utf8')
+      for (const { specifier } of staticImports(source)) {
+        const issue = deepImportIssue(file, specifier)
+        if (issue) issues.push(issue)
+      }
+    }
+    expect(issues).toEqual([])
+  })
+
+  it('keeps the feature resolver off the barrel, which reads plugins before createRouter exists', () => {
+    const file = 'apps/web/src/permissions/features.ts'
+    const specifiers = staticImports(readFileSync(path.join(REPO_ROOT, file), 'utf8')).map(
+      i => i.specifier
+    )
+    expect(specifiers).not.toContain('../plugins/server')
+  })
+
+  it('keeps every UI entry free of pages and heavy dependencies', () => {
+    const entries = tracked.filter(
+      f => pluginIdOfPath(f) !== null && /\/(ui\.ts|ui\/index\.ts)$/.test(f)
+    )
+    const issues = entries.flatMap(f =>
+      uiEntryIssues(f, readFileSync(path.join(REPO_ROOT, f), 'utf8'))
+    )
+    expect(issues).toEqual([])
+  })
+
+  it('reaches the host only through a declared entry', () => {
+    /**
+     * **One group, and every installed plugin is in it.** The rule used to have two tiers, keyed
+     * on a plugin declaring `requires.pluginApi`, because the gate's second pass installed
+     * `defaultPlugins` at refs older than the surface. That field is gone — compatibility is
+     * measured from a plugin's `uses` against the kit's ledger — and with it the tier, so there is
+     * nothing here a released plugin cannot satisfy by being re-exported.
+     */
+    const issues: string[] = []
+    for (const file of tracked.filter(isPluginFile)) {
+      const id = pluginIdOfPath(file)
+      if (!id) continue
+      const source = readFileSync(path.join(REPO_ROOT, file), 'utf8')
+      for (const { specifier, line } of staticImports(source)) {
+        const issue = pluginImportIssue(file, specifier, line)
+        if (issue) issues.push(issue)
+      }
+    }
+
+    if (PLUGIN_IMPORT_ENFORCEMENT !== 'fail') {
+      if (issues.length > 0) {
+        console.warn(`\nplugin import rule (warn-only):\n${issues.map(i => `  ${i}`).join('\n')}\n`)
+      }
+      return
+    }
+
+    expect(
+      issues,
+      'A plugin imports only from declared entries and receives everything else as injected ' +
+        'context. Each line below carries its replacement.'
+    ).toEqual([])
+  })
+})
+
+// ---- the closed sets, at the type level ---------------------------------------------------------
+
+/**
+ * `expectTypeOf` compiles to nothing, so these run in `pnpm typecheck` rather than in vitest — which
+ * is where they belong: what they assert is that the derivations survive, not that a function
+ * returns the right value.
+ *
+ * The first half pins the CORE shape (a closed set that quietly widened to `string` would still
+ * pass every runtime test in the repo) and the RELATION between it and the installed set: core is
+ * always a subset, never wider. It deliberately names no plugin — what `example-feature`
+ * contributes is `example-feature`'s claim, and it lives in that plugin's own
+ * `tests/config/contracts.test.ts`, which is deleted along with it. A host assertion naming the
+ * reference plugin is a host that cannot uninstall it, and uninstalling it is the one thing it is
+ * for. The second half is a FICTIONAL plugin, declared exactly as a real one is, showing that keys
+ * reach `JobTypeOf` / `AgentKeyOf` / `FeatureKeyOf` without anything being installed for it.
+ */
+describe('the closed sets a plugin opens', () => {
+  it('name the kit exactly, and widen for what is installed', () => {
+    expectTypeOf<CoreJobType>().toEqualTypeOf<
+      | 'email.send'
+      | 'activity.record'
+      | 'document.index'
+      | 'document.convert'
+      | 'chat.compact'
+      | 'tenant.purge'
+      | 'event.deliver'
+    >()
+    // A plugin may only WIDEN the kit's set — the property the whole "variants are data" change
+    // bought. Which types a particular plugin adds is that plugin's own test to make.
+    expectTypeOf<CoreJobType>().toMatchTypeOf<JobType>()
+    // The envelope narrows per type — what a handler is handed, and the reason `runHandler`'s
+    // switch could go: this is the property that switch existed to provide.
+    expectTypeOf<JobOf<'chat.compact'>['payload']['conversationId']>().toEqualTypeOf<string>()
+    // The installed agent-key union may only be wider than the kit's own (which keys those are
+    // is the app's business: each example agent is a removable surface).
+    expectTypeOf<(typeof CORE_AGENT_KEYS)[number]>().toMatchTypeOf<AgentKey>()
+    // A plugin's subjects union in beside the kit's; naming one is that plugin's own test.
+    expectTypeOf<'Document'>().toMatchTypeOf<Subjects>()
+    expectTypeOf(queryKeys.members.all).toEqualTypeOf<readonly ['members']>()
+  })
+
+  it('carry a plugin’s own keys through, once one declares them', () => {
+    const ordersShared = {
+      id: 'orders',
+      label: 'Orders',
+      agentKeys: ['orders-triage'],
+      promptKeys: ['orders-triage'],
+      subjects: ['Order'],
+      features: {
+        'orders-beta': {
+          label: 'Orders beta',
+          description: 'x',
+          defaultState: 'off',
+          defaultRolloutUnit: 'tenant',
+          environmentGated: false,
+        },
+      },
+      jobs: [
+        z.object({ type: z.literal('orders.sync'), payload: z.object({ tenantId: z.string() }) }),
+      ],
+      events: {
+        'orders.order.placed': z.object({ orderId: z.string(), total: z.number() }),
+        'orders.order.shipped': z.object({ orderId: z.string() }),
+      },
+    } as const satisfies SharedPlugin
+
+    type Orders = typeof ordersShared
+    expectTypeOf<JobTypeOf<Orders>>().toEqualTypeOf<'orders.sync'>()
+    expectTypeOf<AgentKeyOf<Orders>>().toEqualTypeOf<'orders-triage'>()
+    expectTypeOf<FeatureKeyOf<Orders>>().toEqualTypeOf<'orders-beta'>()
+    // D42: the names a plugin declares, and each one's payload — what types `ctx.emit` and a
+    // handler's `event.payload`, so an undeclared name or a wrong field is a compile error.
+    expectTypeOf<EventNameOf<Orders>>().toEqualTypeOf<
+      'orders.order.placed' | 'orders.order.shipped'
+    >()
+    expectTypeOf<EventPayloadOf<Orders, 'orders.order.placed'>>().toEqualTypeOf<{
+      orderId: string
+      total: number
+    }>()
+
+    // Two installed plugins with events: the host reads names and payloads across the UNION of
+    // their declarations, so one plugin's payload must not collapse to `never` beside another's.
+    const invoicesShared = {
+      id: 'invoices',
+      label: 'Invoices',
+      events: { 'invoices.invoice.paid': z.object({ invoiceId: z.string() }) },
+    } as const satisfies SharedPlugin
+    type Installed = Orders | typeof invoicesShared
+    expectTypeOf<EventNameOf<Installed>>().toEqualTypeOf<
+      'orders.order.placed' | 'orders.order.shipped' | 'invoices.invoice.paid'
+    >()
+    expectTypeOf<EventPayloadOf<Installed, 'invoices.invoice.paid'>>().toEqualTypeOf<{
+      invoiceId: string
+    }>()
+    expectTypeOf<EventPayloadOf<Installed, 'orders.order.shipped'>>().toEqualTypeOf<{
+      orderId: string
+    }>()
+    // A union of names (a handler list typed over every event) is the union of their payloads.
+    expectTypeOf<
+      EventPayloadOf<Installed, 'invoices.invoice.paid' | 'orders.order.shipped'>
+    >().toEqualTypeOf<{ invoiceId: string } | { orderId: string }>()
+  })
+})

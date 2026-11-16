@@ -1,0 +1,226 @@
+/**
+ * The plugin API — the ONE module a plugin's server half imports from the host.
+ *
+ * `import { requestCtx, createRouter, validate } from '@/plugins/api'` and that is the whole of it.
+ * Everything a plugin needs at RUNTIME arrives through an injected context; everything it needs to
+ * NAME (a `Database` in its own service signature, a `Tool`, an `AccessScope`) is a type re-exported
+ * here. The enforcement rule in `tests/helpers/plugins.ts` is the sentence this file makes true:
+ * *a plugin imports only from declared entries, and receives everything else as injected context.*
+ *
+ * The exports below are grouped by the file they come from and sorted by the formatter, so read
+ * them there: `./http` is a request, `./jobs` is background work, `./ai` is agents and tools,
+ * `./chat` is a streamed chat turn a plugin route answers with,
+ * `./access` is row visibility, `./events` is nudges and notifications, `./emit` is declared plugin
+ * events (D42), `./secrets` is a tenant's
+ * credentials at rest, `./identity` is signing a person in and provisioning their memberships.
+ *
+ * **Three things are deliberately NOT here.**
+ *
+ * - `./peers` — `extensions()` and `allTables()` read the whole installed set, which means this
+ *   module would read the plugin barrel, which every plugin imports. Keeping it out means the
+ *   common path is acyclic; importing it is then a deliberate act with its own file to explain
+ *   itself.
+ * - `./ui` and `./ui-wiring` — React. A plugin's server half must never pull the browser half into
+ *   the Worker bundle, and the two UI halves are separately importable for a reason of their own
+ *   (one ships in the main bundle, one must not).
+ * - Schema helpers. `tenantRef`, `timestamps` and `tenantIsolation` are needed at MODULE scope by a
+ *   table file, so they can come neither from a context nor from a module that reads the plugin
+ *   barrel. They are at `@/db/schema/kit` — beside `rls.ts`, below the barrel.
+ */
+
+export type { BindableAgent } from '@my-app/shared/ai/agents'
+export type {
+  AnyServerPlugin,
+  AnyUiPlugin,
+  PluginHeaderItem,
+  PluginHeaderPlacement,
+  PluginNavGroup,
+  PluginRequires,
+  PluginRoute,
+  PluginRouteTier,
+  PluginSeedContext,
+  ServerPlugin,
+  UiPlugin,
+} from '../types'
+export type {
+  AccessScope,
+  ResourceGrantRow,
+  SetResourceGroupsInput,
+  VisibilityResource,
+} from './access'
+export { sharedWithMyGroups } from './access'
+export { eventBinding, eventTrigger, listBindableAgents } from './agent-runs'
+export type {
+  AgentCtx,
+  AgentDecide,
+  AgentInterruptAnswer,
+  AgentInterruptAsk,
+  AgentSummary,
+  Decision,
+  FusedItem,
+  PickOptions,
+  PickResult,
+  PluginAgent,
+  PluginStructuredOptions,
+  PluginToolLoopOptions,
+  SiftOptions,
+  SiftResult,
+  Tool,
+  ToolApproval,
+  ToolCtx,
+  ToolLoopCheckpoint,
+  ToolLoopResult,
+} from './ai'
+export {
+  AiNotConfiguredError,
+  agentCtx,
+  anyTermTsquery,
+  candidatePoolSize,
+  chatModelAvailable,
+  defineTool,
+  fuseByRank,
+  listAgents,
+  recordUsage,
+  toolCtx,
+  toolInputSchema,
+} from './ai'
+export type { AbilityCheck, Actions, MembershipRole, PluginAuth, Subjects, User } from './auth'
+export { hasFeature, isAdminLevel, isGlobalAdmin, isOwnerLevel, requireFeature } from './auth'
+export type {
+  StreamChatEmit,
+  StreamChatOptions,
+  StreamChatResult,
+  StreamChatToolCtx,
+  StreamChatTurn,
+} from './chat'
+export {
+  customEventNameIssue,
+  InvalidCustomEventError,
+  streamChat,
+  usageFeatureIssue,
+} from './chat'
+export type { HookCtx, SeedCtx, Tenant } from './db'
+export { affected, isUniqueViolation, pgErrorCode, rows, transaction } from './db'
+export type { EmailContext, EmailCtx, EmailHandler } from './email'
+export { EMAIL_CATCH_ALL, emailCtx, emailLocalPart, emailSubaddress } from './email'
+export type {
+  AgentEventBinding,
+  AgentEventTrigger,
+  DeliveredEvent,
+  Emit,
+  EmitInput,
+  EmittedEvent,
+  EventContext,
+  EventCtx,
+  EventHandler,
+  EventName,
+  EventPayload,
+  TenantEmit,
+  TenantEmitInput,
+} from './emit'
+export { eventCtx } from './emit'
+export type { ActivityInput, NotifyInput, Realtime } from './events'
+export {
+  durableObject,
+  notify,
+  notifyMany,
+  nudge,
+  nudgeEntity,
+  nudgeUser,
+  nudgeUsers,
+  realtimeEvent,
+  recordActivity,
+} from './events'
+export type {
+  AppRouter,
+  DetachedCtx,
+  PluginMount,
+  PluginPublicMount,
+  PluginPublicMountOptions,
+  PublicSiteCsp,
+  PublicSiteFormPath,
+  PublicSitesDeclaration,
+  RequestCtx,
+  RequestVisibility,
+} from './http'
+export { createRouter, pageWindow, requestCtx, validate } from './http'
+export type {
+  IdpAppRole,
+  PluginDeprovisionResult,
+  PluginIdentity,
+  PluginIdentityUser,
+  PluginLoginMethodDeclaration,
+  PluginMember,
+  PluginProvision,
+  PluginSignInInput,
+  SsoRequirement,
+} from './identity'
+export { identityFor, provisionFor, resolveOwnerTenant } from './identity'
+export type {
+  BackgroundMethods,
+  CronCtx,
+  JobCtx,
+  JobEnvelope,
+  JobHandler,
+  JobInput,
+  JobOf,
+  JobType,
+  ScheduledTask,
+  StartAgentRun,
+  StartAgentRunInput,
+  StartedAgentRun,
+} from './jobs'
+export { cronCtx, jobCtx } from './jobs'
+export type {
+  PlatformDocumentInput,
+  PlatformDocumentResult,
+  PluginIngestFileInput,
+  PluginIngestResult,
+  PluginIngestTextInput,
+  SearchKnowledgeHit,
+  SearchKnowledgeInput,
+  SearchKnowledgeResult,
+} from './knowledge'
+export {
+  deleteIngestedDocument,
+  ingestDocument,
+  ingestDocumentFile,
+  ingestPlatformDocument,
+  PlatformEmbeddingsError,
+  prunePlatformDocuments,
+  searchKnowledge,
+} from './knowledge'
+export type {
+  AgentTraceContext,
+  SpanKind,
+  SpanParams,
+  ToolCallParams,
+  TraceHandle,
+  Tracer,
+} from './observability'
+export {
+  noopTracer,
+  traceChatClient,
+  traceStep,
+  tracingEnabled,
+  withAgentTrace,
+} from './observability'
+export type { PublicCtx } from './public'
+export { memberCan, PUBLIC_MOUNT_ROOT, PUBLIC_SITE_PAGE_CSP_HEADER, publicCtx } from './public'
+export type { StepRealtime } from './realtime-step'
+export { createStepRealtimeFor } from './realtime-step'
+export { openSecret, sealSecret, signState, verifyState } from './secrets'
+export type {
+  Database,
+  DatabaseHandle,
+  Logger,
+  PluginBindings,
+  PluginConfig,
+  PluginContext,
+  PluginLogger,
+  StorageService,
+  StoredObject,
+  StoredObjectMeta,
+} from './types'
+export type { StepCtx, StepOptions, WorkflowCtx } from './workflow'
+export { DuplicateStepNameError, workflowCtx } from './workflow'

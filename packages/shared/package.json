@@ -1,0 +1,44 @@
+{
+  "name": "@my-app/shared",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Private shared contracts: zod schemas, error envelope, pagination, permission types. Consumed as TypeScript source by apps/web (API + UI) and apps/cli via the workspace link — no build step.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./ai": {
+      "types": "./src/ai/index.ts",
+      "default": "./src/ai/index.ts"
+    },
+    "./plugins": {
+      "types": "./src/plugins/index.ts",
+      "default": "./src/plugins/index.ts"
+    },
+    "./plugin-api": {
+      "types": "./src/plugins/api.ts",
+      "default": "./src/plugins/api.ts"
+    },
+    "./*": {
+      "types": "./src/*.ts",
+      "default": "./src/*.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "echo 'shared: contracts are exercised by apps/web and apps/cli tests'",
+    "build": "echo 'shared: consumed as source, nothing to build'",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@ag-ui/core": "1.0.4",
+    "@casl/ability": "^7.1.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

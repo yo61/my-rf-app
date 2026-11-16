@@ -1,0 +1,162 @@
+/**
+ * Templates → per-tenant dashboards (D19). `ensureDefaultDashboards` copies every entry of
+ * `DASHBOARD_TEMPLATES` into `analytics_pages` that the tenant does not have yet — idempotent via
+ * the `(tenant_id, slug)` unique index (slug = template key) — and runs on tenant creation
+ * (`utils/db/tenant-helpers.ts`) and lazily on every `GET /api/analytics/pages`, so a template
+ * added later still reaches existing tenants. `resetToTemplate` / `recreateTemplates` are the
+ * repair paths: `config` is a copy, so template changes do not propagate on their own.
+ * Every function takes `tenantId` from the caller's auth context.
+ */
+
+import type { GroupRef } from '@my-app/shared/groups'
+import type { AnalyticsPage as AnalyticsPageDto } from '@my-app/shared/plugins/analytics/index'
+import { slugify } from '@my-app/shared/tenants'
+import { and, eq, isNotNull } from 'drizzle-orm'
+import type { Database, RequestCtx } from '@/plugins/api'
+import { getTemplate, listTemplates } from '../dashboards'
+import { type AnalyticsPage, analyticsPages } from '../db/schema/analytics-pages'
+
+/** `groups` comes from `grantsForResources` — the row alone cannot know it (D29). */
+export function toAnalyticsPageDto(row: AnalyticsPage, groups: GroupRef[] = []): AnalyticsPageDto {
+  return {
+    id: row.id,
+    tenantId: row.tenantId,
+    slug: row.slug,
+    name: row.name,
+    description: row.description,
+    templateKey: row.templateKey,
+    config: row.config as unknown as AnalyticsPageDto['config'],
+    isDefault: row.isDefault,
+    order: row.sortOrder,
+    createdBy: row.createdByUserId,
+    visibility: row.visibility,
+    groups,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  }
+}
+
+/**
+ * Insert every template the tenant lacks. Returns how many were created (0 = nothing to do).
+ *
+ * A template page is the system's, so it never has a human creator: the visibility predicate lets
+ * a creator keep reading a page later restricted to groups. Rows written when the first reader was
+ * recorded as creator are cleared here, on the path every list read takes; the update touches
+ * nothing once a tenant's rows are clean.
+ */
+export async function ensureDefaultDashboards(
+  db: Database,
+  tenantId: string,
+  features: readonly string[] = []
+): Promise<number> {
+  await db
+    .update(analyticsPages)
+    .set({ createdByUserId: null })
+    .where(
+      and(
+        eq(analyticsPages.tenantId, tenantId),
+        isNotNull(analyticsPages.templateKey),
+        isNotNull(analyticsPages.createdByUserId)
+      )
+    )
+  // D30: a template behind a feature this deployment does not ship must not be seeded. This runs
+  // lazily on every `GET /pages`, so an ungated one would appear in every tenant after a deploy.
+  const templates = listTemplates(features)
+  if (templates.length === 0) return 0
+  const created = await db
+    .insert(analyticsPages)
+    .values(
+      templates.map(t => ({
+        tenantId,
+        slug: t.key,
+        name: t.name,
+        description: t.description,
+        templateKey: t.key,
+        config: t.config,
+        isDefault: t.isDefault ?? false,
+        sortOrder: t.order,
+      }))
+    )
+    .onConflictDoNothing({ target: [analyticsPages.tenantId, analyticsPages.slug] })
+    .returning({ id: analyticsPages.id })
+  return created.length
+}
+
+/** Overwrite a template page's name/description/config/order from its template. */
+export async function resetToTemplate(ctx: RequestCtx, pageId: string): Promise<AnalyticsPage> {
+  const { db, tenantId } = ctx
+  const [page] = await db
+    .select()
+    .from(analyticsPages)
+    .where(and(eq(analyticsPages.id, pageId), eq(analyticsPages.tenantId, tenantId)))
+    .limit(1)
+  if (!page) ctx.notFound('Dashboard not found')
+  if (!page.templateKey) {
+    ctx.badRequest('Only template dashboards can be reset', 'not_a_template_page')
+  }
+  const template = getTemplate(page.templateKey)
+  if (!template) {
+    ctx.notFound(`Template "${page.templateKey}" no longer exists`, 'template_not_found')
+  }
+  const [row] = await db
+    .update(analyticsPages)
+    .set({
+      name: template.name,
+      description: template.description,
+      config: template.config,
+      sortOrder: template.order,
+    })
+    .where(and(eq(analyticsPages.id, pageId), eq(analyticsPages.tenantId, tenantId)))
+    .returning()
+  if (!row) ctx.notFound('Dashboard not found')
+  return row
+}
+
+/** Create missing template pages AND reset the existing ones — the "repair everything" button. */
+export async function recreateTemplates(
+  db: Database,
+  tenantId: string,
+  features: readonly string[] = []
+): Promise<{ created: number; reset: number }> {
+  const created = await ensureDefaultDashboards(db, tenantId, features)
+  let reset = 0
+  for (const template of listTemplates(features)) {
+    const rows = await db
+      .update(analyticsPages)
+      .set({
+        name: template.name,
+        description: template.description,
+        config: template.config,
+        sortOrder: template.order,
+      })
+      .where(
+        and(eq(analyticsPages.tenantId, tenantId), eq(analyticsPages.templateKey, template.key))
+      )
+      .returning({ id: analyticsPages.id })
+    reset += rows.length
+  }
+  return { created, reset: reset - created }
+}
+
+/** `slugify(name)` made unique within the tenant by a numeric suffix. */
+export async function uniquePageSlug(
+  db: Database,
+  tenantId: string,
+  name: string
+): Promise<string> {
+  const root = slugify(name, 'dashboard')
+  const taken = new Set(
+    (
+      await db
+        .select({ slug: analyticsPages.slug })
+        .from(analyticsPages)
+        .where(eq(analyticsPages.tenantId, tenantId))
+    ).map(r => r.slug)
+  )
+  if (!taken.has(root)) return root
+  for (let i = 2; i < 1000; i++) {
+    const candidate = `${root}-${i}`.slice(0, 63)
+    if (!taken.has(candidate)) return candidate
+  }
+  return `${root}-${Date.now().toString(36)}`
+}

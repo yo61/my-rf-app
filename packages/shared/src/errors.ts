@@ -1,0 +1,106 @@
+import { z } from 'zod'
+
+/**
+ * The ONE error envelope every API response uses — from `app.onError`, `notFound`, the
+ * zValidator hook, and `ApiError` thrown in routes. The UI's `api-client.ts` parses this
+ * into `ApiError` so callers can branch on `code`.
+ */
+export const apiErrorSchema = z.object({
+  /** Short human-readable summary, e.g. "Forbidden" */
+  error: z.string(),
+  statusCode: z.number().int(),
+  /** Machine-readable discriminator, e.g. "pending_approval", "validation_failed" */
+  code: z.string().optional(),
+  /** Field-level or structured detail (zod issues, etc.) */
+  details: z.unknown().optional(),
+})
+
+export type ApiErrorBody = z.infer<typeof apiErrorSchema>
+
+/** Well-known `code` values shared by API and UI. Extend per app. */
+export const ERROR_CODES = {
+  validationFailed: 'validation_failed',
+  unauthorized: 'unauthorized',
+  sessionExpired: 'session_expired',
+  forbidden: 'forbidden',
+  notFound: 'not_found',
+  conflict: 'conflict',
+  rateLimited: 'rate_limited',
+  pendingApproval: 'pending_approval',
+  noTenant: 'no_tenant',
+  tenantSuspended: 'tenant_suspended',
+  blocked: 'blocked',
+  /**
+   * 403 (dev login) / `/login?error=` (every redirecting sign-in): a plugin's connection claims the
+   * email's domain and requires single sign-on (`ServerPlugin.ssoPolicy`). `details.method`, when
+   * known, is the `GET /auth/methods` `pluginMethods` id to send the person to.
+   */
+  ssoRequired: 'sso_required',
+  tenancyModeSingle: 'tenancy_mode_single',
+  csrf: 'csrf_failed',
+  /** 403: the API key is valid but its scopes do not allow this method. */
+  insufficientScope: 'insufficient_scope',
+  /** 503: no chat/embeddings provider resolves for the tenant. */
+  aiNotConfigured: 'ai_not_configured',
+  /** 503: the `AGENT_RUN_WORKFLOW` binding is missing, so a run cannot be started. */
+  agentRunsNotConfigured: 'agent_runs_not_configured',
+  /** 409: `?strict=1` and an active run already exists for an exclusive agent. */
+  agentRunActive: 'agent_run_active',
+  /** 429: the tenant already has `AGENT_MAX_ACTIVE_RUNS_PER_TENANT` runs queued, running or parked. */
+  agentRunsLimit: 'agent_runs_limit',
+  /** 400: `POST /api/agents/runs/batch` named an exclusive agent — one run at a time cannot batch. */
+  agentExclusive: 'agent_exclusive',
+  /** 400: an event name no installed plugin declares (D42). */
+  eventUnknown: 'event_unknown',
+  /** 403: the agent does not opt in (`bindable`) to being started by this event (D42). */
+  agentNotBindable: 'agent_not_bindable',
+  /** 429: the tenant's agent spend today has reached `AGENT_TENANT_DAILY_COST_USD`. */
+  aiBudgetExceeded: 'ai_budget_exceeded',
+  /** Event code, not a status: a run stopped because it reached its token or cost budget. */
+  agentBudgetExceeded: 'agent_budget_exceeded',
+  /** Event code, not a status: a run's tool loop ran out under its `policy` with no answer. */
+  agentPolicyExhausted: 'agent_policy_exhausted',
+  /** 404: `POST /api/agui/run` was given a `threadId` that exists but is not this user's. */
+  aguiThreadNotFound: 'agui_thread_not_found',
+  /** 400: the last message of a `RunAgentInput` was not a user turn. */
+  aguiLastMessageNotUser: 'agui_last_message_not_user',
+  /** 400: `RunAgentInput.tools` was non-empty — frontend tools are not supported. */
+  aguiClientToolsUnsupported: 'agui_client_tools_unsupported',
+  /** 400: the user turn's content was not a usable string. */
+  aguiUnsupportedContent: 'agui_unsupported_content',
+  /** 409: the document's text is not available yet — its conversion job has not landed. */
+  documentNotConverted: 'document_not_converted',
+  /** 409: the document's conversion failed, so it has no text and never will without a re-upload. */
+  documentConversionFailed: 'document_conversion_failed',
+  /**
+   * 404: the surface exists in the code but not in this deployment — a feature flag is off.
+   * 404 rather than 403 on purpose: a 403 confirms the feature EXISTS, which is exactly what a
+   * surface shipping dark must not reveal. Same class as `tenancy_mode_single`.
+   */
+  featureDisabled: 'feature_disabled',
+  /**
+   * 409: the interrupt was already answered, declined or expired. Two people opening
+   * the same approval is normal, so one gets a 200 and the other this — and the UI renders it as
+   * "somebody else answered", not as an error.
+   */
+  interruptNotPending: 'interrupt_not_pending',
+  /** 409: the run is not parked, so there is nothing to resume. */
+  runNotAwaitingInput: 'run_not_awaiting_input',
+  /**
+   * 409: the membership is managed by the OIDC issuer (`tenant_users.source = 'idp'`,
+   * `OIDC_MANAGED_TENANCY`) — its role and its existence follow the issuer's claims and events, so
+   * the app may neither edit nor remove it. Change it at the issuer.
+   */
+  idpManaged: 'idp_managed',
+  /** 403: the caller already owns `MAX_OWNED_TENANTS_PER_USER` organisations. */
+  tenantLimitReached: 'tenant_limit_reached',
+  /** 409: another tenant is already linked to that OIDC issuer org (`tenants.external_org_id`). */
+  externalOrgTaken: 'external_org_taken',
+  /**
+   * 409: a plugin's identity provider asserted the email of an existing account it has not proved
+   * it may claim (no `linkByEmail`) — linking it would let one tenant's IdP take over that account.
+   */
+  accountExists: 'account_exists',
+} as const
+
+export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES]

@@ -1,0 +1,14 @@
+packages:
+  - 'apps/*'
+  - 'packages/*'
+onlyBuiltDependencies:
+  - esbuild
+  - workerd
+# cloudflared's postinstall downloads its latest release (~38 MB) on every install; only
+# `pnpm dev:tunnel` needs it, and installs it there on first use (apps/web/scripts/cfld.mjs).
+ignoredBuiltDependencies:
+  - cloudflared
+# Transitive security pins; drop each once its parent stops resolving the vulnerable version.
+overrides:
+  '@esbuild-kit/core-utils>esbuild': 0.25.12
+  '@tailwindcss/typography>postcss-selector-parser': 6.1.5

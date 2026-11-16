@@ -1,0 +1,441 @@
+# /rf-plugin — reference
+
+What `pnpm plugin` reads, what it refuses, and what each command proves. The design and its
+reasons are `docs/CONCEPTS.md` §16; the seam is `apps/web/src/plugins/CLAUDE.md`. This file is for
+looking things up mid-run.
+
+**Contents:** [Exit codes](#exit-codes-pnpm-plugin---help-is-authoritative) ·
+[The manifest](#the-manifest--my-app-pluginjson-in-the-repo-pluginjson-in-the-host) ·
+[How `add` classifies each file](#how-add-classifies-each-file-of-the-source-repo) ·
+[What `check` verifies](#what-check-verifies) ·
+[Version clashes, at `add` time](#version-clashes-at-add-time) ·
+[Dependencies, at `upgrade` time](#dependencies-at-upgrade-time) ·
+[Where an install is recorded](#where-an-install-is-recorded) · [`defaultPlugins`](#defaultplugins) ·
+[Public mounts — the host's guard](#public-mounts--the-hosts-guard) ·
+[Identity and SSO](#identity-and-sso) ·
+[Two things nothing else will catch](#two-things-nothing-else-will-catch)
+
+## Exit codes (`pnpm plugin --help` is authoritative)
+
+| Code | Meaning | What it usually is |
+|---|---|---|
+| 0 | ok | a plan printed, or an apply that landed |
+| 1 | error | anything the script names and stops on |
+| 2 | usage | a missing or unknown argument |
+| 3 | unreachable with no cached mirror | a bad repo URL, or offline with nothing under `.upgrade/plugins/` — `--no-fetch` reuses the cache |
+| 4 | applied with rejects (`upgrade`) | work remains; the version stamp is deliberately withheld until the `*.rej` files are gone |
+| 5 | no `rocketflare-plugin.json` at the SOURCE | the path or repo is not a plugin. That is the filename at a plugin REPOSITORY's root; the copy inside a host is `plugin.json` |
+| 6 | a requirement is unmet | the `minKit` floor, `requires.surfaces`, `requires.plugins`, or a symbol its `uses` names that this kit's ledger does not carry. **Nothing is written** |
+| 7 | the target path exists | most often "plugin '<id>' is already installed — `pnpm plugin upgrade <id>` moves it forward" |
+
+## The manifest — `rocketflare-plugin.json` in the repo, `plugin.json` in the host
+
+**One file, two names, and the distinction is load-bearing when you are reading a diagnostic.**
+`rocketflare-plugin.json` is the name at the **root of a plugin repository** — it is what `add`
+looks for at the source, and what exit 5 is about. `plugin.json` is the name it is copied in under,
+at `apps/web/src/plugins/<id>/plugin.json`, and that copy is the surface's **anchor**: presence is
+`existsSync` on it, so deleting the directory IS uninstalling and there is no bookkeeping to drift.
+**Every `pnpm plugin check` finding about a manifest names the in-tree `plugin.json`**, because that
+is the file to edit; `pnpm plugin export` writes the other name back out. The kit's own reference
+plugin is the worked example — `apps/web/src/plugins/example-feature/plugin.json`:
+
+```json
+{
+  "id": "example-feature",
+  "label": "Example feature",
+  "version": "0.1.0",
+  "repo": "https://github.com/rocketflare-dev/rocketflare.git",
+  "subdir": "",
+  "anchor": "apps/web/src/plugins/example-feature/plugin.json",
+  "minKit": "0.8.0",
+  "uses": {
+    "@/plugins/api": ["createRouter", "requestCtx", "RequestCtx", "requireFeature", "validate"],
+    "@/db/schema/kit": ["tenantIsolation", "tenantRef", "tenants", "timestamps"],
+    "@testkit/integration": ["createTestEnv", "request", "setupTestDatabase"]
+  },
+  "paths": [
+    "apps/web/src/plugins/example-feature/**",
+    "packages/shared/src/plugins/example-feature/**",
+    "apps/cli/src/plugins/example-feature/**",
+    ".claude/skills/example-feature/**"
+  ],
+  "registries": [
+    "apps/web/src/plugins/server.ts",
+    "apps/web/src/plugins/ui.ts",
+    "apps/web/src/plugins/schema.ts",
+    "packages/shared/src/plugins/index.ts",
+    "apps/cli/src/plugins/index.ts"
+  ],
+  "requires": { "surfaces": [], "plugins": [] },
+  "dependencies": { "apps/web": {}, "packages/shared": {}, "apps/cli": {} },
+  "bindings": [],
+  "crons": [],
+  "apiPrefixes": [],
+  "vars": [],
+  "workerExports": [],
+  "skills": ["example-feature"],
+  "schema": { "tables": ["example_notes"], "rlsExcluded": [] },
+  "migrations": ["example_notes, tenant-scoped, RLS policy"]
+}
+```
+
+Field notes, in the order they bite:
+
+- **`id`** matches `^[a-z][a-z0-9-]*$`, never contains the kit's name (the rename translator would
+  rewrite it), and is never `index` / `server` / `ui` / `schema` / `types` / `worker-exports` —
+  those are barrel filenames. It is the namespace for everything: job types `<id>.verb`, query-key
+  roots `<id>:…`, the API prefix `/api/<id>`, the CLI command, feature/prompt/agent keys, AG-UI
+  CUSTOM events `<id>.`, and **tables prefixed with the id's first hyphen-separated segment**
+  (`example-feature` → `example_*`, `analytics` → `analytics_*`; a longer prefix is welcome, not
+  required). That last one is a convention rather than something the tooling derives — nothing
+  anywhere turns an id into a table name — so what is enforced is the COLLISION: `check` fails when
+  two installed plugins declare the same table name.
+- **`minKit`** is a TOP-LEVEL key — a sibling of `id` and `version`, never nested under `requires`,
+  which is refused by name. One bare `X.Y.Z`: a FLOOR, no ceiling, no range language (`>=`, `^` and
+  a second bound are all errors). It says how old a kit this plugin still works with, which is the
+  only half of compatibility a plugin can state honestly.
+- **`uses`** is the other half and is **DERIVED, never hand-written**: `{ "<entry>": ["<symbol>"] }`,
+  the host symbols this plugin imports, written by `pnpm plugin export` from its own files. The kit
+  emits the matching `## Surface ledger` in `docs/plugin-api.md`, and compatibility is the set
+  difference — every symbol `uses` names that the ledger does not carry fails the install, naming
+  the symbol and the import that replaces it. A hand-written `uses` is a claim rather than a
+  measurement, which is the failure mode all of this replaced.
+- **`requires.kit` and `requires.pluginApi` are gone**, and a manifest still carrying either fails
+  LOUDLY naming the replacement rather than being ignored. Both were predictions about kits that did
+  not exist yet, and both went stale (`docs/CONCEPTS.md` §16, decision 5c).
+- **`repo` is required** and `subdir` optional — a plugin you cannot fetch again cannot be upgraded.
+  `repo` equal to the kit's own repository with an empty `subdir` means **vendored**: `upgrade`
+  defers to `pnpm kit:upgrade` and `minKit` is not checked at all, because the same release cut
+  both.
+- **`anchor`** is the path the manifest is copied to inside a host, and that copy is written by
+  `pnpm plugin add` from the source manifest. **Do not hand-edit it**: a plugin's version exists
+  once, which is what stops an anchor left behind failing every install of a correct release.
+- **`registries`** are the six host barrels, listed so `pnpm kit:upgrade` can flag a kit change to
+  one of them as `touches-plugin-registry` — the kit CAN move ground under a plugin.
+- **`dependencies`** are installed into the HOST's packages (`pnpm --dir apps/web add …`). A plugin
+  ships no `package.json` of its own into a host.
+- **`bindings[]`** is `{ type, binding, name?, consumer?, className?, storage? }`, and `type` is one
+  of **six**: `kv`, `queue`, `r2`, `workflow`, `durable_object`, `images` (the last declared only, one per app). Anything else (`d1`, `vectorize`,
+  `hyperdrive`…) is refused at INSTALL, naming the type, rather than surfacing as a 503 after a
+  deploy that silently skipped it. `binding` is what the code reads off `Cloudflare.Env` and is
+  identical in both environments; `name` is the account-scoped half. Resource names come out as
+  `<app>-<id>-<name>[-staging]`, and `<APP>_<ID>_<NAME>[_STAGING]` for KV, mirroring the kit's own
+  `<APP>_RATE_LIMIT[_STAGING]`.
+  - The first three are **created** by `cf-provision.sh`; `workflow` and `durable_object` are
+    **declared only** — `wrangler deploy` registers both from the block.
+  - A `workflow` or `durable_object` must declare `className`, the class its `worker-exports.ts`
+    re-exports. A `durable_object` must ALSO declare `storage` (`"sqlite"` or `"none"`), which
+    picks `new_sqlite_classes` over `new_classes` and **cannot be changed afterwards** — which is
+    why it is required rather than defaulted — and it declares no `name` at all, because it has no
+    account-scoped resource.
+- **`vars[]`** is `{ key, example?, secret? }`. `secret: true` is a Worker secret
+  (`.dev.vars.example` + `pnpm provision secrets <env>`); anything else is a `[vars]` key written
+  into BOTH tomls, because the parity test compares the keys.
+- **`workerExports`** are the Durable Object / Workflow class names the plugin's
+  `apps/web/src/plugins/<id>/worker-exports.ts` re-exports. **Nobody adds a line by hand**: that
+  file is the sixth barrel's half, `plugin add` writes the barrel line, and `plugin check` fails if
+  the file does not export every name declared here. Cloudflare resolves `class_name` against the
+  named exports of `src/worker.ts` and nowhere else, which is the whole reason the barrel exists.
+- **Paths** stay contained, and `add`, `upgrade` and `remove` refuse otherwise before writing:
+  `anchor` and `paths` inside the plugin's own roots (and its `.claude/skills/<id>…` directories),
+  `coreEdits[].file` and `dependencies` keys as plain paths inside the repository, nothing under
+  `.git/` and nothing through a symlink. The add plan prints the anchor
+- **`coreEdits`** are `{ file, after, lines[] }` — lines a CORE file needs (the analytics plugin's
+  `/cubejs-api` + `/mcp` dev-proxy lines and `@nivo/heatmap` alias in `apps/web/vite.config.ts`).
+  `add` inserts `lines` after the first line containing `after`, at its indentation, idempotently;
+  `remove` reverts them byte for byte; `upgrade` follows the new release's list. Anchored on text,
+  never a line number; a missing anchor THROWS naming the file. The plugin still edits nothing.
+- **`skills`** are the agent skills the plugin ships, one directory name each. The plugin keeps
+  them at `skills/<dir>/SKILL.md` (plus any companion files — `reference.md`, one file per
+  provider…) in its OWN tree, and `add` copies each to **`.claude/skills/<dir>/`**, where Claude
+  Code finds it. `<dir>` is `<id>` or `<id>-<what>` — namespaced like a table, so it can never
+  shadow a kit `rf-*` skill — and the SKILL.md frontmatter `name:` must equal it, with a
+  `description:` that says WHEN to use it (that sentence is all an agent sees before choosing it).
+  A skill directory that already exists in the host stops the install (exit 7). `upgrade`
+  REPLACES a skill's files rather than patching them and deletes the ones a release dropped;
+  `remove` deletes the directory. `.claude/` at the root of a plugin repository is still that
+  repository's own tooling and is never copied — only `skills/` ships. `example-feature` ships one.
+- **`claudeHooks`** are Claude Code hooks for the HOST's coding agent (a Stop hook nudging it to
+  keep a guide in sync): `{ "<Event>": [{ "command", "matcher"?, "timeout"? }] }`, the event one
+  of Claude Code's (`PreToolUse`, `PostToolUse`, `Notification`, `UserPromptSubmit`, `Stop`,
+  `SubagentStop`, `PreCompact`, `SessionStart`, `SessionEnd`), `timeout` 1–600 seconds. The
+  command is held to ONE shape — `node "$CLAUDE_PROJECT_DIR/.claude/skills/<dir>/<script>.mjs"`
+  plus plain `--flags` — where `<dir>` is one of its declared `skills` and the release ships
+  `skills/<dir>/<script>`; anything else (`pnpm …`, `cd … &&`, a pipe) is refused by `add`,
+  `upgrade` and `check`. `add` merges each as its own matcher group at the end of its event in
+  `.claude/settings.json` (creating the file if absent), leaving every other hook in place; the
+  plan shows the change first. `upgrade` replaces this plugin's entries with the release's;
+  `remove` takes out exactly them — a round trip leaves the file byte-identical, and deletes it if
+  `add` created it. A plugin's entries are the hooks whose command runs one of `.claude/skills/<id>`
+  or `<id>-*` (the longer id wins when two share a prefix), so hand-editing one keeps it the
+  plugin's.
+- **`hostFiles`** are content the plugin SEEDS for the developer — a guide's markdown, a generated
+  module, images: `[{ "path", "from" }]`, `from` a file or directory in the plugin repository,
+  `path` under `docs/<id>/`, `apps/web/public/<id>/` or `apps/web/src/host/<id>/` and nowhere
+  else (no `..`, not `skills/`, not the manifest). `add` copies a file only where nothing is
+  (the plan says `seeded` or `kept`); `upgrade` never touches one — it reports what the release
+  changed upstream, and seeds only an entry the release ADDS, where absent; `remove` leaves them
+  all and lists them for you to delete by hand. The surface records them in `hostFiles`, outside
+  `paths`. Plugin code imports `apps/web/src/host/<id>/…` as **`@/host/<id>/…`** (its own id
+  only — `tests/config/plugins.test.ts`), through the existing `@/*` alias.
+- **`schema.tables`** drives the "generate a migration" step, the isolation-test check and the
+  cross-plugin collision check below — so a table missing from it is a table nothing verifies;
+  `schema.rlsExcluded` is the plugin's half of `RLS_EXCLUDED_TABLES`, with a reason, for a table
+  that has no `tenant_id`.
+- **`migrations[]`** carries *descriptions*, never file names. A plugin ships no migration, ever.
+
+## How `add` classifies each file of the source repo
+
+The rule it enforces: **a plugin writes only inside its own four roots — plus the skills it
+declares, its declared hooks in `.claude/settings.json` and the host files it seeds** — so an
+install stays reversible by deleting a directory (the seeded host files excepted: they are yours).
+
+| Role | Which paths | What happens |
+|---|---|---|
+| `copy` | `apps/web/src/plugins/<id>/`, `packages/shared/src/plugins/<id>/`, `apps/cli/src/plugins/<id>/`, `docs/plugins/<id>/` | copied and translated through the same `applyReplacements()` the rename used |
+| `copy` (skill) | `skills/<dir>/**` for a `<dir>` listed in `"skills"` | copied to `.claude/skills/<dir>/**`, translated like code; an UNdeclared `skills/<dir>` is `refused` |
+| `seed` | a `"hostFiles"` entry's `from` (a file, or everything beneath a directory) | copied to its `path` only where absent, translated; then the developer's — `upgrade` and `remove` never touch it |
+| `note` | `docs/upgrades/*` | copied to `docs/plugins/<id>/upgrades/` — the release chain `plugin upgrade` walks |
+| `fragment` | `migrations/**` | **never copied**; printed as a `pnpm db:generate --custom` step |
+| `meta` | `rocketflare-plugin.json`, `README.md`, `CHANGELOG.md`, `LICENSE`, `LICENSE.md`, `SECURITY.md` | read, not copied |
+| `repo-only` | `.github/`, `.git/`, `node_modules/`, `.claude/`, `scripts/` (its release shim), `package.json`, `pnpm-lock.yaml`, `biome.json`, `.gitignore` and the other root dotfiles | the plugin repository's own; never copied, never refused |
+| `refused` | anything else | the install stops. A plugin that edits `api/index.ts` on the way in is an install nobody can reverse |
+
+A manifest may list `"appOwned"` paths inside `paths`: `upgrade` leaves them alone, and `remove` lists files changed or added there and needs `--force-app-owned`.
+
+## What `check` verifies
+
+One `✖` line per failure and exit 1 on any; silence plus `✔ n plugin(s) check out` otherwise.
+**Every finding is `<file>:<line> <what is wrong> — <the exact change>`** — the line number only
+where the complaint is AT a place in a file, never fabricated. Per installed plugin:
+
+- the **anchor** file exists — "the surface says installed, the tree says no" — and **parses**;
+- **every manifest field**, naming the field and its legal values: a non-semver `version`, a
+  `minKit` that is not a bare `X.Y.Z` or is nested under `requires`, a retired `requires.kit` or
+  `requires.pluginApi`, a `requires.plugins` entry written as `"<id>@<range>"`, a `uses` that is not
+  a map of arrays, a cron that is not five fields, a `vars` entry with no key, `schema.tables` that
+  is not an array, a malformed `coreEdits` entry, and the `bindings[]` rules;
+- **`requires` and the floor** still hold: this kit is at or above `minKit` (skipped for a vendored
+  plugin, and for one being authored inside the kit itself — there the floor is always one bump
+  ahead of `package.json` until `pnpm kit:release` runs), every required surface is present, and
+  every required plugin is installed at or above its `minVersion`;
+- **the ledger diff** — every symbol the plugin's `uses` names against what this kit's
+  `## Surface ledger` provides. This is the compatibility check, and unlike the two version numbers
+  it replaced it cannot go stale: `uses` is derived from the plugin's own imports and the ledger is
+  generated from the kit's own source. Each finding names the symbol and its replacement import;
+- for each of the six barrels, the **line and the half agree both ways** — a barrel that names a
+  plugin half that is not on disk, and a half on disk that no barrel names;
+- no **`*.rej`** anywhere under its directories ("an upgrade left work behind");
+- **its skills, both ways**: every declared skill has `.claude/skills/<dir>/SKILL.md` whose
+  frontmatter `name:` is `<dir>` and whose `description:` is not empty (a skill without both never
+  triggers), and no directory in the plugin's namespace (`<id>` or `<id>-*`) exists that it does
+  NOT declare — `remove` would leave that one behind. When two installed ids share a prefix
+  (`example`, `example-feature`), a directory belongs to the longer one;
+- **its Claude Code hooks, both ways**: each declared hook is in `.claude/settings.json` exactly
+  as declared, no hook there runs one of its skills without being declared, every script a hook
+  runs exists, and the file parses;
+- when it declares tables, **some migration tag names `plugin-<id>`** — otherwise the tables were
+  never generated, which is the most common thing to have skipped;
+- **every declared dependency is really in the host `package.json`** — `plugin add --apply` runs
+  `pnpm --dir <pkg> add`, and until now nothing ever looked again, so an install that failed
+  part-way left a plugin whose imports cannot resolve while every other check read as clean;
+- **`workerExports` both ways**: its `worker-exports.ts` exists and exports every declared name (a
+  name in the manifest but not the file is a binding pointed at nothing, and `wrangler deploy`
+  refuses the whole script for it), and it declares every name the file exports (a class the
+  manifest does not name is invisible to provisioning, which reads that list to write the binding
+  block). A file carrying an `export *` is skipped in both directions — its names cannot be known
+  without resolving the module, and guessing teaches an author to distrust the audit;
+- when it declares tenant-scoped tables, **a tenant-isolation test exists** under
+  `src/plugins/<id>/tests/api/`. This is the kit's one non-negotiable that the kit itself cannot
+  write, and it is structural: it proves such a test EXISTS, not that it is right, and the message
+  says so. It wants a file that creates a SECOND organisation and names it or the property;
+- when it declares a `durable_object` binding, **`hooks.onTenantDeleted` is declared somewhere in
+  its tree** — a Durable Object is state the FK cascade cannot reach, so a deleted tenant's DO
+  state outlives it, and no other check can see that because its tables are gone;
+- **no two installed plugins declare the same table name.** The prefix convention is what keeps
+  them apart and nothing derives a table name from an id, so the collision is the checkable half —
+  and nothing else in the kit sees it. TS2308 catches a duplicated EXPORT symbol, not a duplicated
+  `pgTable('orders', …)`, and past that point drizzle-kit emits DDL for one name twice and a single
+  generated `DROP TABLE` takes the other plugin's data. It fails for BOTH plugins and in both tiers
+  (neither is excused, and there is no tier to be excused by), because neither plugin is
+  non-compliant on its own — the fault is the combination, and the host cannot run it either way.
+
+**No tiers.** Every installed plugin is checked strictly. The two tiers keyed on a declared
+`requires.pluginApi` are gone with it, because nothing left is a rule a RELEASED plugin cannot
+retroactively satisfy: `uses` is a measurement of the plugin's own code, which anybody holding it
+can re-derive with `pnpm plugin export`. `warn:` and `note:` survive for findings that are not
+faults in a plugin at all — a plugin declaring no `minKit`, or a vendored one.
+
+`pnpm plugin check --json` prints the same audit as data: `{ ok, plugins, failures, warnings,
+notes }`. `failures` and `warnings` are separate lists so `ok` keeps meaning "this exits 0", and
+each entry carries `file`, `line`, `problem`, `fix`, `kind` and `assert` as fields. CI runs the same
+command a person runs.
+
+**Deliberately NOT checked**, because each would fail a correct plugin: the anchor's version
+against the surface's (`plugin add` writes the anchor from the source manifest, so they cannot
+differ), and the installed version against the `defaultPlugins` pin (below).
+
+## Version clashes, at `add` time
+
+`plugin add` compares every declared dependency against the range the host's `package.json` already
+has, and against every other installed plugin's declared range. A difference is printed under
+**Dependency clashes** and becomes a **human** step, because `pnpm add` would overwrite the
+existing range without a word — and `package.json` is `manual` in `.rocketflare.json`, so no kit
+upgrade ever reconciles it for anyone afterwards. It warns rather than refusing: a clash is very
+often the intended change, and refusing would make an ordinary dependency upgrade impossible
+without editing somebody else's manifest.
+
+A host range INSIDE the declared one is not a clash and passes `plugin check` (`^2.3.0`, or an
+operator's `2.2.5`, for a plugin declaring `^2.2.4`); `add` leaves it alone. A range wider than the
+declared one or disjoint from it fails. `pnpm add name@^2.2.4` saves `^<resolved>`, not the declared
+range, so `add` writes the declared range back into the host `package.json` and runs
+`pnpm install --no-frozen-lockfile` to re-key the lockfile.
+
+## Dependencies, at `upgrade` time
+
+`plugin upgrade` diffs the plugin's declared `dependencies` at the installed release (read from
+the mirror at `from`) against the new one's, per package dir, and `--apply` acts on each one whose
+declaration changed — after the files are written, before the surface is stamped:
+
+| change | action |
+|---|---|
+| added, or range changed | `install` the way `add` does — skipped (`none`) when the host already holds a range inside the new one |
+| removed, a plugin brought it in (`addedDependencies`), no other plugin declares it, host range **exactly** the old declared one | `remove` it from the host `package.json` |
+| removed, another installed plugin declares it | `keep`, naming that plugin |
+| removed, host pins some other range (the operator's or the kit's) | `keep`, naming the range |
+| removed, the host declared it before any plugin did (the kit's own, even at the same range) | `keep` |
+| removed, the plugin's surface has no `addedDependencies` (installed by kit 0.17.1 or earlier) | `keep` — remove it by hand if nothing imports it |
+| removed, not in the host | `none` |
+
+**Who added a package** is recorded on the plugin's surface as `addedDependencies`
+(`{ "<pkg dir>": ["name", …] }`): `add --apply` records each package the host did not declare at
+all, and `upgrade --apply` adds what it newly installs and drops what it removes (a package kept
+because a peer still declares it stays recorded, so the last plugin to drop it can remove it).
+A removal checks the union of every plugin's record. Equal range strings alone are no evidence:
+the kit may declare a package at exactly the range a plugin did. A surface written before the
+record existed gets one at its next `upgrade --apply`, holding only what that upgrade installs.
+
+Then one `pnpm install --no-frozen-lockfile` if any file changed. An `install` whose range is not
+inside what another installed plugin declares would fail that plugin's `plugin check`, so it is
+**refused** (exit 6, nothing written) — unlike `add`'s warning. Every row is in the plan, and in
+`--json` as `dependencies` (`{ pkg, name, change, from, to, have, action, reason }`) with the
+refusals as `dependencyClashes`. Re-running at the same version writes nothing.
+
+## Where an install is recorded
+
+A `kind: 'plugin'` **surface** carrying `source: { repo, subdir, version, commit }`, `installedAt`,
+`requires` and `history[]` — so §13's upgrade machinery covers it for free. Two files:
+
+- **`.rocketflare.json`** — an app, committed, so the team and CI see it.
+- **`.rocketflare.local.json`** — the git-ignored **sidecar**, used with `--local` and always inside
+  the kit itself (`app === null`). A plugin wired into a kit checkout is an authoring convenience,
+  not part of what the kit ships; committing it would push wiring for files a copy does not have
+  into every copy made from that commit. `pnpm plugin list` marks a sidecar install `(local)`.
+
+Readers see the merged view and should not care which file a surface came from; only a writer
+chooses, and `readManifest()` (`scripts/lib/manifest.mjs`) is the one kit-vs-app predicate.
+
+## `defaultPlugins`
+
+`.rocketflare.json` carries a top-level `defaultPlugins` array — the plugins a **fresh clone**
+installs before the app is first run. `scripts/bootstrap.mjs`'s `plugins` step reads it, skips every
+id already installed, runs `pnpm plugin add <repo> --apply` for the rest, then `pnpm db:generate`
+and `pnpm db:migrate` once. `pnpm bootstrap --no-plugins` skips the step. The kit's own list is
+EMPTY — analytics is opt-in (`/rf-plugin add analytics`) — and an app lists the plugins its own
+fresh clones should get, each at a PINNED ref. **`check` does not compare the installed version
+against that pin**: a released app or kit pins whichever plugin version was current when it shipped,
+so the comparison would fail every plugin release that had moved past it, by construction, until a
+release pinning the new one — which cannot happen before the plugin is released.
+
+In the kit repository only, `.github/ci-plugins.json` lists CI-only canaries (analytics, at a
+pinned ref) that `kit.yml`'s `plugins` job installs on every kit pull request on top of
+`defaultPlugins`, and `kit:release` checks both lists. A fresh clone never installs them; the
+rename deletes the file.
+
+## Public mounts — the host's guard
+
+`ServerPlugin.publicMounts` entries are `['/api/hooks/<id>/…', router, options?]`. The host
+(`apps/web/src/api/middleware/public-mounts.ts`) wraps each in a per-IP KV rate limit — a bucket
+named after the prefix, default 120 requests / 60 s, a no-op without `RATE_LIMIT_KV` — and the 1 MB
+body cap. `options` changes either: `{ rateLimit: { max, windowSeconds } | false, bodyLimitBytes }`.
+`false` is for a sender with fixed IPs that batches, whose signature is the gate; `bodyLimitBytes`
+(≤ 10 MB — `tests/config/plugins.test.ts` refuses more) REPLACES the 1 MB cap beneath the prefix for
+every content type (JSON, form-encoded SAML POST, `application/scim+json`). The same test refuses a
+public mount outside the plugin's own `/api/hooks/<id>` and any authed mount under `/api/hooks`.
+
+## Identity and SSO
+
+The contract is in `apps/web/src/plugins/CLAUDE.md` (never write a session; prove the tenant first;
+`linkByEmail` only for a proved domain). The semantics, from `apps/web/src/plugins/api/identity.ts`:
+
+- **`identityFor(c, '<id>').signIn({ subject, email, emailVerified, name, tenantId?, role? })`**,
+  returned from a public handler that has PROVED a person (a verified SAML assertion, an
+  id_token). The kit links the identity under provider `plugin:<id>` — the plugin namespaces
+  `subject` itself, `<connection>|<nameId>` — admits, upserts an `idp` membership (`source =
+  'idp'`, through `upsertIdpMembership` in `services/idp-tenancy.ts`, shared with the OIDC
+  reconcile), mints the session and answers the redirect, refusals included. A subject with no
+  link needs `linkByEmail: true` (proved domain) to attach to an existing account or create a new
+  one, else `account_exists` in both cases; a `BOOTSTRAP_ADMIN_EMAILS` address is refused always.
+  A suspended tenant named by `tenantId` answers `no_access`.
+- **`provisionFor(ctx, '<id>')`** is the cookie-free half for SCIM or a sync job: `findUser`,
+  `upsertUser`, `setMembership`, `removeMembership`, `deprovision`, `listMembers`. The
+  tenant-taking methods answer 403 `tenant_suspended` for a suspended tenant.
+  `removeMembership` drops the `idp` row and unpins sessions. `deprovision` is a LEAVER (SCIM
+  `active: false`): the same plus deleting the sessions pinned to that tenant — in `multi` never a
+  block, never another tenant (their other tenants, sessions and keys survive).
+- **Under `TENANCY_MODE=single`** the one tenant is the deployment: every method takes only ITS id
+  (another is a missing tenant), and `deprovision` BLOCKS the leaver (`blocked: true`,
+  `blocked_source = 'plugin:<id>'`, every session ended). Only `setMembership` lifts YOUR block
+  (never an admin's); `upsertUser` and `signIn` do not.
+- **`ServerPlugin.loginMethods(cfg)`** feeds `GET /auth/methods` `pluginMethods` — a login-page
+  button whose `startPath` must be under `/api/hooks/<id>/` (dropped and logged at runtime
+  otherwise, and `tests/config/plugins.test.ts` fails). Its `errors` give the login page copy for
+  the plugin's own `?error=<id>.<name>` codes: redirect a failed sign-in navigation to
+  `/login?error=<id>.x&email=` rather than answering JSON to a browser.
+- **`ServerPlugin.ssoPolicy(db, email, { config })`** answers `{ required: true, methodId }` (one of
+  the plugin's own `loginMethods` ids) for an address whose domain its connection proved it owns,
+  else `null`. The kit then refuses that address a magic link, Google, Microsoft, OIDC, dev login
+  and every other plugin's `signIn`, and routes the person to the method; the plugin's own `signIn`
+  passes. A plugin holding several tenants' connections names the claiming one with
+  `connectionId` and passes the same id to `signIn`; another connection is then refused like
+  another plugin. Asked once per sign-in attempt — keep it one indexed lookup. A throw fails CLOSED
+  for that email; `BOOTSTRAP_ADMIN_EMAILS` are exempt (break-glass).
+- **Host side, for a NEW sign-in path:** `ssoDecisionFor(db, cfg, emails, logger)`
+  (`routes/auth/sso.ts`, the barrel bound into the pure `evaluateSsoPolicyForAll`), then
+  `ssoAllows(decision, 'core' | { pluginId, connectionId? })`; a refusal is `ssoRequiredRedirect(c, decision, {
+  returnUrl })`, or 403 `sso_required` + `details.method` for a JSON route. Pass every address the
+  sign-in involves (asserted and account).
+
+Worked examples: `apps/web/src/plugins/example-feature/api/sso.ts` (dev-only) and `sso-policy.ts`;
+`tests/api/identity.test.ts` under that plugin drives `provisionFor`.
+
+## Events and agent triggers — "start an agent when X happens" (D42)
+
+A plugin that wants others to react to something it does DECLARES an event and emits it; it never
+calls another plugin, and never starts an agent it does not own by key from a request.
+
+- **Declare** in the shared entry, `events: { '<id>.<thing>.<happened>': zodSchema }`, and list the
+  same names in the manifest's `"events"` array. `check` fails a name outside `<id>.`, any `kit.`
+  name, one another installed plugin declares, and one the shared source never mentions.
+- **Emit** after the row is stored: `await ctx.emit(name, { payload, idempotencyKey: '<thing>:<id>' })`
+  from a route, run or tool, or with `tenantId` from a job, cron, email or public handler. The
+  payload is kept `EVENTS_RETENTION_DAYS` (7) and never logged: ids plus what subscribers need.
+- **Subscribe**: `eventHandlers: [{ event, name, handle: (e, ctx) => mine(e, eventCtx(ctx)) }]`,
+  idempotent on `e.id`. An agent subscribes itself with `triggers: [eventTrigger(event, { where?,
+  input })]` — no handler needed.
+- **A picker** ("On submit, start …"): the agent opts in with `bindable: [eventBinding(event,
+  { input })]`; the editor lists choices from `GET /api/agents/bindable?event=` (or
+  `listBindableAgents`); the emitting plugin's own handler reads the STORED choice and calls
+  `eventCtx(ctx).startBoundAgent(key)`, which re-checks the opt-in (403 `agent_not_bindable`).
+- **Test** with `deliverEvents(env, db)` from `@testkit/integration` after the emitting request.
+  Worked example: `apps/web/src/plugins/example-feature/events/` and `agents/note-stats.ts`.
+
+## Two things nothing else will catch
+
+- **Migrations are the host's, always.** Each `meta/NNNN_snapshot.json` carries the whole cumulative
+  schema, so importing a foreign one teaches drizzle a current state that has never heard of this
+  app's tables — and the *next* `pnpm db:generate` emits `DROP TABLE` for real data. Silent,
+  delayed, destructive.
+- **Expand and contract, never rename.** drizzle-kit's rename prompt has no non-interactive answer,
+  so a plugin release that renames a column is a release nobody can apply unattended. Add, migrate,
+  backfill, remove in a later version.

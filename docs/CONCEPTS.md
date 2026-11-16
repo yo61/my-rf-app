@@ -1,0 +1,1550 @@
+# CONCEPTS — what is built, and why
+
+One section per subsystem: what it does, the invariant it protects, the decision behind it
+(D-numbers), and its **Known gaps**. Check here before assuming a capability exists; update it when
+you change one. **Keep it short** — a section states the rule and points at where the detail lives.
+Conventions and mechanics belong in `.claude/rules/*.md` and the per-directory `CLAUDE.md` files;
+setup in `SETUP.md`; Cloudflare topology in `docs/DEPLOY.md`; RLS in `docs/RLS.md`.
+
+| § | Section | § | Section |
+|---|---|---|---|
+| 1 | [Tenancy](#1-tenancy) | 9 | [AI layer](#9-ai-layer) |
+| 2 | [Auth](#2-auth) | 10 | [Deployment](#10-deployment) |
+| 3 | [API shell](#3-api-shell) | 11 | [CLI](#11-cli) |
+| 4 | [Database](#4-database) | 12 | [Shared package](#12-shared-package) |
+| 5 | [Background work and realtime](#5-background-work-and-realtime) | 13 | [Upgrading a copy](#13-upgrading-a-copy) |
+| 6 | [Email and storage](#6-email-and-storage) | 14 | [Definition of done](#14-definition-of-done-for-the-kit) |
+| 7 | [UI shell](#7-ui-shell) | 15 | [Feature flags](#15-feature-flags) |
+| 8 | [Analytics](#8-analytics) | 16 | [Plugins](#16-plugins) |
+|  |  | 17 | [Connectors](#17-connectors) |
+
+**Layout (D26).** A pnpm workspace: `apps/web` (the Worker — Hono API + React UI, §§1–10),
+`apps/cli` (§11), `packages/shared` (zod contracts, §12), and `apps/evals` (developer-run eval
+suites on vitest 4, §9 — never part of the gate).
+
+---
+
+## 1. Tenancy
+
+**Every row of domain data belongs to a tenant, and the schema is the same for one tenant or many.**
+
+- **`TENANCY_MODE = multi | single` (D25)** is configuration, not a fork. `multi`: users join many
+  tenants via `tenant_users`, the session carries the current one. `single`: one tenant, every
+  admitted user auto-joins as `member`; multi-only surface is 404 `tenancy_mode_single`
+  (`requireMultiTenant`) and hidden via `useTenancyMode()`. Switching to `multi` needs no migration.
+  The auto-join (`onNoTenant`) runs for a NEW person `SIGNUP_MODE` admits, for dev login and for a
+  `BOOTSTRAP_ADMIN_EMAILS` admin (who creates the tenant on an empty database); a returning person
+  with no membership gets a tenant-less session instead. Enterprise identity in single mode: the
+  one tenant IS the deployment, so the identity seam takes only its id (another is a tenant that
+  does not exist), a plugin's `deprovision` BLOCKS the leaver (§16), `OIDC_MANAGED_TENANCY` refuses
+  to load (it creates one tenant per issuer org), and the admin console's issuer-org link and
+  organisation delete answer 404 `tenancy_mode_single`.
+- **`SIGNUP_MODE = open | invite_only | approval` (D9)**, default `invite_only`. Uninvited logins
+  land on `/pending`; `approval` also files an `access_requests` row at *verify* time;
+  `open` gives a personal tenant through `onNoTenant`. Invitations are handled first on every login
+  path, and every fallback gates on "has no memberships", not "is new". `POST /api/tenants` refuses
+  a person with no membership whose access request is pending or rejected (403
+  `pending_approval`; a global admin is not held by one), and one person's owned organisations stop
+  at `MAX_OWNED_TENANTS_PER_USER` (default 10, global admins exempt, 403 `tenant_limit_reached`),
+  counted under a lock on the user row so simultaneous creations cannot pass it.
+- **Roles (D10).** `owner | admin | member` plus `support` (minted from `/admin`, visible to the
+  customer); `users.isGlobalAdmin` is a platform flag. Default for a new subject: owner/admin/support
+  `manage`, member `read` with route-scoped writes. "Own row" is always a route predicate — **CASL
+  conditions are used nowhere**. Deleting a tenant and changing `owner` need an explicit
+  `role === 'owner'` check. The matrix lives in `apps/web/src/permissions/` (+ its `CLAUDE.md`).
+- **Admin area.** `/admin` + `/api/admin/*` behind `globalAdminMiddleware` is the only cross-tenant
+  surface. A global admin with no membership can still reach it, so there is always someone to
+  approve the first request. Entering a tenant creates a real `support` membership; it lasts only
+  as long as the role: when `is_global_admin` clears, by demotion, a claim going or a suspension,
+  every `support` row of that person goes in the same transaction.
+- **Invitations carry authority, so they have the same limits as a role change.** Only an
+  owner-level actor (`isOwnerLevel`) may issue or resend an `owner` invitation, on the single and
+  bulk routes alike (403 before any row). A member removed from a tenant takes their pending
+  invitations with them, in the removal's transaction, on the members route and on every path that
+  ends an `idp` or a `support` membership for good; a global admin's stay, because their authority
+  is the platform flag (so leaving support revokes nothing). Accepting over an `idp` row leaves the
+  row as it is (the invitation is still marked accepted). Mail is bounded by Postgres: a resend
+  inside `INVITATION_RESEND_COOLDOWN_SECONDS` (five minutes) answers 429 and keeps the link
+  already sent, and `invitation_send_counters` caps the mail per UTC day per person across every
+  tenant (`INVITATION_EMAILS_PER_USER_PER_DAY`, 500) and per tenant
+  (`INVITATION_EMAILS_PER_TENANT_PER_DAY`, 1000), an upsert per scope with a conditional update so
+  simultaneous sends cannot pass it. A bulk invite stops at the limit and reports the rest as
+  `failed` / `send_limit`; one that queued nothing is the 429 itself.
+- **Deleting a tenant has two halves.** The `tenantRef()` FK cascade removes everything in
+  Postgres; the **`tenant.purge`** job (§5) removes the R2 prefix and runs each plugin's
+  `onTenantDeleted`. The queue binding is checked *before* the `DELETE`.
+- **Groups and visibility (D29).** Tenants declare group types → groups → members;
+  `AuthContext.groups` is resolved with the membership (a Bearer key uses its **creator's** groups, looked up on
+  every request). A restrictable resource has an explicit `visibility` column (`tenant | groups`)
+  plus a junction table. **The column decides and the rows only grant**, so an empty grant list
+  means "owner and admins only". It never falls back to "public". The predicate is SQL in
+  `services/access.ts` (`accessScopeOf` → `visibleDocuments` / plugin predicates), **ANDed with the
+  tenant predicate, never substituted for it**. Admin-level roles bypass it. On kit resources groups grant READ only; a plugin may define its own
+  grants over its own resources (`edit`, `publish`) and enforces them itself.
+  Deleting a group that still grants something is 409 `group_in_use` (`?force=1` narrows).
+  `access.changed` nudges the affected users.
+- **Tenants managed by the OIDC issuer (IdP-managed tenancy, `OIDC_MANAGED_TENANCY`, §2).**
+  `tenants.external_org_id` (unique, NULL for every tenant the app made) ties a tenant to an org at
+  the issuer, and `tenant_users.source` (`manual | idp`) says who manages a membership. The
+  sign-in reconcile creates a tenant per org in the claims, keeps its name in step, and adds or
+  removes the person's `idp` rows; identity events change them between sign-ins.
+  **A tenant made in the app is linked by slug — decided:** on an org's first sign-in, an
+  unlinked tenant whose slug is the claim's `slug` becomes that org's tenant, so a tenant made by
+  hand (or before managed tenancy) is not duplicated. The issuer's slug is trusted to name it; a
+  tenant already linked to another org is never taken. When the slugs differ, a global admin links
+  it (Admin → the organisation → Identity provider org; `PUT /api/admin/tenants/:id/external-org`,
+  409 `external_org_taken` when another tenant holds the org), and can delete a duplicate the
+  org's first sign-in made (`DELETE /api/admin/tenants/:id`, the owner's delete with its slug
+  confirmation), which frees the org for the link. Under managed tenancy the issuer decides which
+  organisations exist, so `POST /api/tenants` and a slug change on `PATCH /api/tenant` answer 409
+  `idp_managed`, whoever asks, and the session's `canCreateTenant` is false so the UI offers no
+  "Create organisation"; the slug-link path above is only reachable from a tenant that
+  already had the slug, made by hand or before managed tenancy.
+  `idp_synced_at` on both tables records when the issuer last spoke about the row, so a stale event
+  is skipped. **A tenant created this way has no owner — decided:** managed tenancy never writes
+  `owner` (or `support`), so the last-owner guard only ever counts owners a person chose, and
+  losing an org at the issuer can never delete a tenant's last owner. Ownerless is a state the kit
+  already allows: owner-only actions stay open to global admins (`isOwnerLevel`), and an owner can
+  be made later from a MANUAL membership. An `idp` row is read-only in the app — role change and
+  removal answer 409 `idp_managed` (People shows a "Managed" badge instead of controls); manual
+  rows in the same tenant work as ever.
+- **Isolation = predicates + inert RLS (D1)** — §4, `docs/RLS.md`.
+
+**Known gaps:** no IdP group sync (SCIM/SAML claims); no group hierarchy or per-group roles;
+conversations, runs, prompts and non-Knowledge files have no visibility; agent-written documents
+are always `tenant`; no audit log beyond `activity_events`; no personal API keys (tenant keys only).
+
+## 2. Auth
+
+- **Sessions are rows**: `user_sessions`, 30-day sliding TTL (`SESSION_TTL_MS`), never past the
+  row's own `max_expires_at` when it has one (any sign-in under IdP-managed tenancy: sign-in +
+  `OIDC_SESSION_MAX_AGE_DAYS`, at most 30 days, the cookie ending with it), cookie `__Host-session` (`HttpOnly`,
+  `SameSite=Lax`, `Secure` outside development). `authMiddleware` resolves session → user →
+  membership → groups → features in one query. The second strategy is a Bearer tenant API key
+  (hashed, expiry, soft revoke), with scopes `authMiddleware` enforces on every request: `read`
+  allows GET/HEAD/OPTIONS, `write` or `*` allows everything; anything else is 403
+  `insufficient_scope`. The CASL check on the creator's role still applies on top.
+- **Magic link** is the zero-credential path: a 256-bit, 15-minute, single-use, SHA-256-hashed
+  token. With no `RESEND_API_KEY` the URL is logged, except when `APP_ENV=production`, where it is
+  never written to the logs. Past five sign-in mails to one address in 15 minutes the route still
+  answers 202 but mints nothing and sends nothing (KV, keyed by a hash of the address). Opening the
+  link consumes nothing: `GET /verify` redirects to `/magic-link/confirm`, and only its "Sign in"
+  button (`POST /verify`, same-origin only) spends the token, so mail security scanners that fetch
+  every link on delivery (Defender Safe Links, Mimecast) cannot. Dev-login exists and 404s in production.
+- **OAuth is a registry** (D11): one generic `/auth/:provider` router over `ProviderDefinition`s
+  (Google, Microsoft), each an `openid-client` code + PKCE flow (`providers/openid.ts`, HTTP Basic
+  client auth). Microsoft discovers the `common` authority, so an `id_token` naming the person's own
+  tenant is accepted and one naming another is refused; for Google and Microsoft an `id_token`'s
+  claims are checked but not its signature (identity comes from userinfo / Graph). A token
+  response must be `application/json`; an error body of any other type is `oauth_failed`.
+  Redirect URIs come from `APP_URL`, accounts link by verified email (Microsoft: the user
+  principal name, whose domain the directory must have verified, not `mail`), and tokens are AES-GCM
+  encrypted under `OAUTH_ENCRYPTION_KEY`. The return path is `?returnUrl=`
+  (`?redirectTo=` still accepted); the flow cookie carries state, PKCE verifier and a nonce.
+- **Any OIDC issuer** (`providers/oidc.ts`): set `OIDC_ISSUER` + `OIDC_CLIENT_ID` (+ optional
+  `OIDC_CLIENT_SECRET`) and an `oidc` provider appears, labelled `OIDC_LABEL`. Endpoints come from
+  discovery (cached per isolate, refused unless its `issuer` matches exactly); code + PKCE S256 +
+  `nonce`; the `id_token` is verified with jose against the issuer's JWKS (`iss`, `aud`, `exp`,
+  `nonce`; an unknown `kid` refetches the set — rotation). The identity key is `${iss}|${sub}` in
+  `oauth_providers.provider_user_id`, so no migration; a changed issuer falls back to
+  verified-email linking. The issuer must assert `email_verified: true`: a missing flag is
+  unverified (refused as `email_unverified` — no email linking, no admission) unless
+  `OIDC_TRUST_EMAIL=true` opts in an issuer that controls the claim (single-tenant Entra); an
+  explicit `false` is always refused. `AUTH_OIDC_ONLY=true` leaves the login page one "Continue with <label>" button (never an
+  automatic redirect: a live issuer session must not become a silent login) and refuses
+  `/auth/google|microsoft`. It also turns the magic-link routes off on the server: `POST /auth/magic-link/request`
+  mints nothing (same 202), `POST /verify` answers `/login?error=oidc_only`, and `/auth/methods` says
+  `magicLink: false`. Invitation emails carry an accept URL, not a magic link, so nothing else changes. With an `end_session_endpoint`, `POST /auth/logout` answers
+  `200 { endSessionUrl }` (RP-initiated logout back to `/login?signedOut=1`, sent as both
+  `post_logout_redirect_uri` and `logout_uri` — Amazon Cognito returns only on the latter); otherwise
+  204. A token exchange the issuer refuses with HTTP 400 `UserLambdaValidationException` (a Cognito
+  Pre Token Lambda denying the person) lands on `/login?error=no_access` — "You don't have access to
+  this app" — not the generic error. Setup: `SETUP.md` → "Sign in with any OIDC issuer".
+- **IdP-managed tenancy (`OIDC_MANAGED_TENANCY=true`)**: the issuer, not the app, says which of
+  its orgs the person may use the app in. Its id_token carries them under `OIDC_ORGS_CLAIM`
+  (default `orgs`): `[{ id, name, slug?, role }]`. The callback reads them from the payload
+  `oidc.ts` already verified (zod, `@my-app/shared/idp`; missing or malformed → ignored and
+  logged, the sign-in is plain OIDC) and runs `reconcileIdpClaims` (`services/idp-tenancy.ts`) on
+  **every** sign-in, before `completeLogin` — linked users never reach `admitUser`, so it cannot
+  live there. Roles map through `OIDC_ROLE_MAP` (`issuerRole:admin|member` pairs; an unmapped role
+  skips the org); an existing manual admin/member row is adopted as `idp`, an `owner` or `support`
+  row is left alone. An org gone from the claims deletes its `idp` row (with the member's tenant
+  settings) and unpins sessions pinned to it. Admission comes from the claims, not `SIGNUP_MODE`:
+  a person with an org, `OIDC_ADMIT_CLAIM` true or `OIDC_GLOBAL_ADMIN_CLAIM` true is created if
+  new and never given an access request (any pending one is closed once they hold a tenant). The
+  global-admin claim sets `is_global_admin` with `global_admin_source = 'idp'`; the claim going
+  clears it only when that source is `idp` (the admin console writes `manual`). A person admitted
+  with no org gets the normal no-tenant pages. Every session, a magic link's or a dev login's as
+  much as an OIDC one, ends `OIDC_SESSION_MAX_AGE_DAYS` (default 7, at most 30) after sign-in
+  however active it is, so everyone is reconciled from fresh claims at least that often. Writes
+  never overwrite a newer change: a sign-in stamps what it writes with the token's `iat`, never
+  over a row an event stamped later, and updates a membership only as it read it (an owner
+  promotion in between wins; a row removed in between is inserted again, since the claims grant
+  it); a removal deletes a row only if nothing has stamped it since the event. A first sign-in
+  whose new tenant's slug clashes picks again, up to five times. Tenancy is §1.
+- **Identity events (`POST /api/identity/events`)**: between sign-ins the issuer posts signed
+  events (Standard Webhooks: `webhook-id`, `webhook-timestamp`, `webhook-signature`, verified
+  against `IDENTITY_WEBHOOK_SECRET` over the raw body, five minutes' tolerance, two signatures
+  during a rotation — `auth/standard-webhooks.ts`). `person.suspended`, `membership.removed`,
+  `membership.role_changed`, `grant.revoked` (org-wide, or one person) and `org.suspended` remove
+  or change `idp` memberships; `person.suspended` also ends the person's sessions and the global-admin
+  role the issuer granted (a `manual` grant stays); `org.renamed`
+  renames the tenant. Each does what the next sign-in's reconcile would, so nothing outlasts a
+  sign-in that says otherwise (a suspended org's members are back when the issuer lets them sign
+  in). The person is found by the OIDC link (`<issuer>|<sub>`), else by email: an event carrying a
+  `sub` with no link can still reach an account by email, but never one linked to another subject at
+  this issuer, while an event with no `sub` has only the email (a person before their first
+  sign-in); the org by
+  `external_org_id`. Applied before answering, idempotently and in any order: an event older than
+  the row's `idp_synced_at` is stale and skipped, and a role change never creates a membership.
+  204 for applied, stale, unknown person or org, and unknown type; 400 for a malformed known type;
+  401 for a bad signature; 404 when not configured.
+- **Plugin sign-in (the identity seam, §16)**: a plugin that proves a person itself — a SAML
+  assertion, a per-tenant OIDC connection — finishes with `identityFor(c, id).signIn({ subject,
+  email, emailVerified, name, tenantId?, role? })` (`plugins/api/identity.ts`), never by writing
+  a session. The kit links the identity in `oauth_providers` under provider `plugin:<id>` (the
+  plugin namespaces `subject`, e.g. `<connection>|<nameId>`), else finds the person by email, else
+  `admitUser`s them — by `SIGNUP_MODE`, or as an IdP admission (`admittedBy: 'idp'`) when
+  `tenantId` + `role` are asserted, which also upserts an `idp` membership through the same
+  primitive the OIDC reconcile uses. Then `completeLogin` pins that tenant and sets the cookie.
+  `emailVerified: false`, a blocked person, a stale tenant and a subject linked elsewhere are the
+  usual `/login?error=` redirects. `ServerPlugin.loginMethods(cfg)` adds buttons to the login page
+  (`GET /auth/methods` → `pluginMethods`, `<plugin id>:<method id>`), each a full-page navigation
+  to a `startPath` under the plugin's own `/api/hooks/<id>/`, optionally behind an email field
+  (`askEmail` → `?email=`, home-realm discovery). A method may carry `errors`, copy for its own
+  `?error=<plugin id>.<name>` codes: its routes redirect a failed navigation to `/login` with one
+  (and `?email=`, which refills that method's field), and the page shows the server-sent copy,
+  never URL text; a code outside its namespace drops the method. They show under `AUTH_OIDC_ONLY` too: they are
+  SSO, and `oidcOnly` turns the kit's non-SSO methods off. A plugin link is not listed on the profile's
+  sign-in methods and cannot be unlinked there (`DELETE /auth/providers/:provider` knows only the
+  kit's providers).
+- **SSO required per email domain (`ServerPlugin.ssoPolicy`, `api/auth/sso-policy.ts`)**: once an
+  organisation turns SSO on, its people may sign in ONLY through it. Core cannot know which
+  domains are theirs — the connections and their DNS-verified domains live in a plugin — so it
+  ASKS every installed plugin, in parallel, once per sign-in ATTEMPT (never per request: a minted
+  session is trusted until it ends): `{ required: true, methodId }` names one of that plugin's own
+  `loginMethods`, or `null`. Enforced server-side at: the magic-link request (no token is minted;
+  a token-free "use single sign-on" email links to the login page instead — still 202 with the
+  same body, so nothing leaks to the requester, and the real person learns where to go rather than
+  waiting for a link that never comes), magic-link verify (a link minted before the policy
+  existed is spent and refused), the Google / Microsoft / OIDC callback (the asserted email AND a
+  linked account's own, checked before anyone is admitted or linked), dev login (403
+  `sso_required` + `details.method`, so development shows what production does) and every
+  plugin's `identityFor().signIn` — which passes only for a plugin that CLAIMED the address and,
+  when its policy names a `connectionId`, only through that connection, so a second tenant's
+  connection cannot sidestep the first's. Where the sign-in involves two addresses (asserted and
+  account), each must be claimed by the connection signing in. `/auth/cli` and invitation acceptance
+  need a session, so they inherit it; an invitee's magic-link request gets the SSO email with the
+  invite as `returnUrl`. Refusals land on `/login?error=sso_required&method=<plugin id>:<method id>`
+  and the login page offers that method directly (email prefilled from the SSO email's link),
+  using the label `/auth/methods` gives — never text from the URL. **Decided:** a policy that
+  THROWS (or answers garbage) **fails closed** for that email, logged at `error` — failing open
+  would hand the magic-link door to anyone who can make the lookup fail; the claim is attributed to
+  the throwing plugin, so its own sign-in still works. **Break-glass:** `BOOTSTRAP_ADMIN_EMAILS`
+  are exempt (logged at `warn` when a claim is bypassed) — they live in deployment config only an
+  operator can change, so a broken connection can never lock out the console that would fix it;
+  `is_global_admin` alone is not exempt (it is a database flag). A `methodId` the plugin does not
+  offer keeps the requirement and drops the hint.
+- **Hardening (D12)**: random tokens hashed with SHA-256, a required encryption key, CSRF by origin
+  allow-list (Bearer is exempt), and a KV sliding-window rate limit on login routes that no-ops
+  without `RATE_LIMIT_KV`. Return paths pass one rule, `isSameOriginPath` in
+  `@my-app/shared/paths`: no control character or backslash anywhere, then same-origin
+  (`redirectToSchema`, `safeRedirectPath`, `safeReturnUrl`). The OAuth flow cookie is `__Host-`.
+- **CLI handoff (D26)**: `GET /auth/cli?redirect_uri=http://127.0.0.1:<port>/callback` allows only
+  loopback targets and creates nothing: a signed-in person goes to `/cli/confirm`, and only its
+  button (`POST /auth/cli/confirm`) mints the revocable tenant key `cli:<hostname>` and answers the
+  loopback URL to navigate to. The CLI sends a random per-login `state`, the server passes it back,
+  and the CLI ignores a callback without it. Details: `.claude/rules/api.md`.
+
+**Known gaps:** no provider token refresh; the rate limit is approximate; no session management UI
+beyond "log out everywhere"; CLI keys differ from other keys only by name. OIDC: one issuer per
+deployment; the `groups` claim is read into the profile but **not stored or mapped** to kit groups
+or roles; no `id_token_hint` on logout (id_tokens are not kept, so the issuer may ask to confirm);
+no back-channel or front-channel logout; `OIDC_TRUST_EMAIL=true` trusts every email the issuer
+sends (no per-domain rule) — set it only for an issuer that controls the `email` claim; the client secret
+is sent as `client_secret_basic` only (no `private_key_jwt`). IdP-managed tenancy: without
+`IDENTITY_WEBHOOK_SECRET` claims are as fresh as the last sign-in, so a removal waits for the next
+sign-in or the session's end; an identity event the issuer gives up on is healed only then too;
+events are applied in the request, not queued; a removal is not remembered once applied (the row
+goes), so a sign-in whose id_token was issued in the second or two before a removal event, or
+before a concurrent sign-in that cleared global admin, can restore what that removed until the next
+sign-in or the session's end; one orgs claim, one role map and no per-org role
+overrides; the app writes nothing back to the issuer; the slug is taken from the claim once and
+never follows a later rename; `person.suspended` revokes no API keys: a key acts as its creator,
+so the keys in the tenants they lost stop working, and those in their manual tenants do not.
+Plugin sign-in: the kit trusts the plugin's word on `subject`, `email`, `emailVerified` and the
+tenant entirely (proving them is the plugin's job); one plugin may not name another's id, but
+nothing enforces that the id passed to `identityFor` is the caller's own; in multi mode
+`deprovision` is per tenant by design and never blocks — a person a tenant's IdP deactivates keeps
+their other tenants, the sessions selected to them and their keys there, and a session with NO
+pinned tenant is not ended (it re-resolves to another membership, or to none); in single mode it
+blocks (§16), but `removeMembership` alone leaves a signed-in person with no tenant, who can file
+an access request; an IdP block is lifted only by `setMembership`, so a plugin that reactivates
+without one leaves the person blocked; a link keeps working after the proof behind it is gone
+(a domain removed from a connection, an address later added to `BOOTSTRAP_ADMIN_EMAILS`): the
+plugin re-checks its domains before `signIn`; and a plugin link is invisible on the profile
+page. SSO required: sessions that already exist when a domain turns it on are not ended
+(they run to their TTL), API keys are untouched, a throwing policy locks that email's non-SSO
+sign-in until it recovers (only the bootstrap admins are exempt), linking a provider to a
+signed-in account is not checked, and the host trusts the plugin's word that it owns the domain.
+
+## 3. API shell
+
+- **One Worker, one app** (D5): `src/worker.ts` exports `{ fetch, queue, scheduled }` plus the
+  DO/Workflow classes; `api/index.ts` exports `app` so tests call `app.request(req, env, ctx)`.
+- **Config (D3/D4)**: `loadConfig(env)` validates `Cloudflare.Env` with zod once per isolate.
+  Routes read `c.get('config')`. `APP_ENV` replaces `NODE_ENV`, and `process.env` is banned in `src/`.
+- **Middleware order is deliberate** (error envelope → logger → config → security headers → body
+  limit → CORS → CSRF → DB → tracing → mounts). Auth is per mount. The ASSETS catch-all 404s every
+  API prefix, so a missing route never returns `index.html`. Order and exceptions:
+  `.claude/rules/api.md`.
+- **Contracts (D13)**: zod schemas from `@my-app/shared` are used by the server, UI and CLI.
+  There is no `hono/client` RPC. Errors are `{ error, statusCode, code?, details? }` everywhere,
+  and success bodies are bare.
+- **Routes are thin** and never run long work (§5).
+- **Local dev ports**: Vite :3000 proxies to `wrangler dev` :3001, both `strictPort`, unless
+  `DEV_UI_PORT` / `DEV_API_PORT` are set (shell, then `.dev.vars`; `scripts/lib/dev-ports.mjs` is the
+  one reader). `APP_URL` follows the UI port by hand — the Worker cannot read the shell — and
+  outside production CORS/CSRF also allow the loopback twin of `APP_URL` and of the request's own
+  loopback origin. `SETUP.md` 1.6.
+
+- **Tunnel**: `pnpm dev:tunnel` runs cfld through `apps/web/scripts/cfld.mjs`. That script
+  downloads cloudflared (pinned in `scripts/lib/cloudflared.mjs`) the first time there is no
+  override, no PATH binary and no managed copy. `pnpm install` never builds the package.
+  `SETUP.md` 1.10.
+
+**Known gaps:** `pnpm dev:tunnel` always targets :3000 (cfld reads `package.json`); `pnpm dev:api`
+alone reads `DEV_API_PORT` from the shell only, not `.dev.vars`; no `/api/ready` smoke step against a preview; no OpenAPI (`@hono/zod-openapi` is the
+path); no per-PR previews.
+
+## 4. Database
+
+- **Two drivers, one client per request (D35, replacing D2's "postgres.js only")**:
+  `DATABASE_DRIVER` picks Drizzle over the Neon serverless driver (`neon`: neon-http per query, a
+  WebSocket `Pool` opened for `db.transaction`) or over `postgres.js` (`postgres`, through
+  Hyperdrive — any Postgres). A missing var means `postgres`; the kit's tomls say `neon`;
+  `.dev.vars` and `.env.test` say `postgres`, so local work and the suite run postgres.js; the seam
+  below is what makes that a safe stand-in for the deployed driver.
+  `openDatabase(env)` (`db/client.ts`) is the one resolver — URL `PREVIEW_DATABASE_URL ??
+  DATABASE_URL` under `neon`, `?? HYPERDRIVE.connectionString ??` in between under `postgres` — and
+  the client is built per request / consumer message / step / cron run and closed in `waitUntil` or
+  `finally`. No LISTEN/NOTIFY, advisory lock or PREPARE on the request path under either.
+  Why two: Hyperdrive caps an account at 25 configs (a fleet of apps cannot each have one) and
+  sandboxes have no TCP out, but Hyperdrive is also how a copy reaches a Postgres that is not Neon.
+  Detail and the switch: `docs/DEPLOY.md` § Database driver, `docs/NEON-DRIVER.md`.
+- **The driver seam: code never sees the driver** (`src/db/CLAUDE.md`). `db/client.ts` is the only
+  place the two differ, and every divergence is either normalised there or banned everywhere else.
+  Normalised: a raw `db.execute()` is `unknown` (`Database` is drizzle's `PgDatabase` base) and is
+  read with `rows()` / `affected()`, because postgres.js returns an array with `.count` and Neon
+  `{ rows, rowCount }`; raw arrays parse to arrays under both (Neon's own parsers installed on
+  postgres.js, `ARRAY_PARSERS`); a SQLSTATE is read with `pgErrorCode()` / `isUniqueViolation()`.
+  Raw timestamps are Postgres's text under both. Banned by `tests/config/driver-results.test.ts`
+  (an AST scan over `src/`, installed plugins included): a cast, index or `.rows`/`.count` read on
+  a raw result, a driver import, a SQLSTATE compared by hand, session state (a statement `SET`,
+  `set_config(…, false)`, a session advisory lock, a temp table) outside a transaction callback —
+  neon-http runs every other query on a fresh connection — and `LISTEN` anywhere.
+- **Proved under both drivers.** The `driver` vitest project is the conformance suite for the seam:
+  each test states one equivalence and passes unchanged under both drivers
+  (`tests/config/driver-conformance.test.ts` fails a skip or a per-driver expectation).
+  `pnpm test` runs the suite under `postgres`, then the `driver` project under `neon` through the
+  local proxy — so every gate, a copy's CI included, proves the deployed path. `kit.yml` runs the
+  whole suite under `neon` with the CI plugins installed (`GATE_SUITE_DRIVER=neon`); locally
+  `GATE_SUITE_DRIVER=neon pnpm gate test` does the same, and `pnpm dev:db:up --neon` runs the
+  deployed driver on the local database. Time limits scale by one latency factor per target
+  (`vitest.config.ts`: 1 local `postgres`, 4 through the proxy, 12 on a real Neon branch); no test
+  carries a budget of its own.
+- **The gate** (`pnpm gate`, `scripts/lib/gate-lib.mjs`): lint → typecheck → test → build,
+  stopping at the first failure (`--keep-going` runs all; `pnpm gate <step…>` and `--skip` are for
+  iterating locally — no workflow passes `--skip`). It is the pre-commit gate, a copy's one CI job
+  and Launch's ship gate. `pnpm gate --list --json` is the contract a step-by-step runner reads:
+  `{ schema: 1, steps: [{ id, command, database }] }` in run order, validated by
+  `packages/shared/src/gate.ts`; `schema` rises only when an existing field changes meaning, so a
+  reader tolerates a new step or field. There is no generated-files step: `typecheck` regenerates
+  `worker-configuration.d.ts` and compiles against it (commit what changes); the
+  `docs/plugin-api.md` diff is the kit's own check (`kit.yml`), since a copy publishes no plugin
+  API; `pnpm plugin check` runs at the end of `plugin add|upgrade --apply` (exit 8 when the written
+  tree fails it) and in `plugin-ci.yml`.
+- **Verified once (opt-in, for an app Launch ships).** After a green sandbox gate Launch's GitHub
+  App posts a `launch/gate` check run keyed by the tree (`external_id: tree:<sha>`). With the
+  repository variable `LAUNCH_GATE_APP_ID` set to that App's id, the first step of `ci.yml`'s
+  `Gate` job (`scripts/gate-verified.mjs`, rules in `scripts/lib/gate-verified-lib.mjs`) looks for one from
+  THAT app, `success`, for the tree CI is about to test — on a pull request the merge commit's tree,
+  found on the PR head (so it holds only while the branch contains main's tip); on a push to main
+  the pushed commit's tree, found on the commit or its PRs' heads. Found, `Gate` runs gitleaks and
+  `pnpm gate build` only; anything else — unset, another app, another tree, an API error — runs the
+  full gate. Unset, no lookup runs at all. Trust is the app id: anyone with `checks: write` can name
+  a check `launch/gate`, only Launch's App can post one under its id.
+- **`pnpm test` picks its target from the environment** (`scripts/lib/test-plan.mjs`), never by
+  probing, and prints it first. **Local** (the default): it starts the compose test Postgres and
+  Neon proxy itself (`docker compose … --profile neon up -d --wait`; Docker down is a failure that
+  names both fixes, never a skip), then every package, the web suite under `postgres`, and the
+  `driver` project under `neon`. The narrow scripts (`pnpm web test:api|ui|config|driver`) are the
+  inner loop: `postgres`, no compose management.
+- **Remote target — an ephemeral test database** (`pnpm test` with `TEST_DATABASE_BRANCH` set): the
+  whole gate's tests where there is no Docker and only 443 out — a coding sandbox, whose
+  orchestrator (Launch) creates a throwaway Neon branch per gate attempt and passes its owner
+  connection string. The runner sets `TEST_DATABASE_EPHEMERAL=1`, `DATABASE_DRIVER=neon`, an empty
+  `APP_DATABASE_URL` (the app role stays NOLOGIN) and runs every web project; the postgres half of
+  the conformance pass is skipped (no TCP) and said so. `TEST_DATABASE_EPHEMERAL=1` without a
+  branch, or `GATE_SUITE_DRIVER=postgres` with one, is refused. `safetyCheck()` (`tests/helpers/db-safety.ts`) still
+  refuses any non-local `DATABASE_URL` unless ALL hold: that profile, the `neon` driver, a
+  `*.neon.tech` host, `TEST_DATABASE_BRANCH` matching `^gate-[a-z0-9]+-\d+$`, and
+  `TEST_DATABASE_ENDPOINT` equal to the `ep-…` id in the URL. The branch name is not in a Neon
+  connection string, so the name alone is only a claim; the endpoint id is, and binds the claim to
+  that URL (a stale opt-in in a shell cannot bless another database). The profile runs 2 forks
+  (`TEST_MAX_WORKERS` overrides; a small Neon compute allows ~100 connections, the local sizing
+  assumes 300), a 60 s test and 120 s hook limit (the factor of 12: real round trips, a
+  cold-starting compute; `TEST_LATENCY_FACTOR` raises the factor on any target — a slow sandbox
+  machine running a test by hand — and never lowers it, `tests/helpers/latency.ts`), and
+  skips `db-roles.test.ts` (postgres.js over TCP, and a superuser to make owner roles). Global setup
+  is unchanged: role → migrate → grants → truncate → seed, as the connecting role; its FIRST
+  connection (`db-roles`) waits for the database (`waitForDatabase`, `scripts/lib/sql.ts`) exactly
+  as the migrator does, because the neon driver reports a WebSocket that failed before Postgres
+  answered as an `ErrorEvent` with no message, and one such failure used to fail the whole run.
+  Every Neon `Pool` comes from `createNeonPool` (`db/client.ts`), whose `error` listeners turn a
+  dropped connection into a rejected query rather than an uncaught exception that kills the run.
+  `migrate.ts`,
+  `db-roles.ts` and `seed.ts` `process.exit` when done, as `db:check` does: Cloudflare's container
+  egress interceptor never ends a closed database WebSocket's stream, so Node would never exit.
+- **Conventions**: one file per table, `tenantRef()` + `timestamps()` (`timestamptz`), append-only
+  enums, `vector(1024)` (a new dimension means a new table). `migrate.ts` creates the `vector`
+  extension first. Detail: `.claude/rules/database.md`.
+- **Local port is chosen** (`scripts/dev-db.mjs`): each checkout gets its own compose project and
+  port, written back to `DATABASE_URL`, so two copies never share a database.
+- **Or an existing database** (`pnpm bootstrap --db-url <url>`): for a machine with no Docker (a
+  coding sandbox on a Neon branch). The URL goes into `DATABASE_URL` and nothing is started; a
+  `*.neon.tech` URL also sets `DATABASE_DRIVER=neon` there (HTTPS + WebSocket only, which is what a
+  sandbox allows; `--driver` overrides). An
+  off-box `DATABASE_URL` (not loopback) is left alone by `dev-db.mjs` and skips preflight's Docker
+  checks. The seed runs there with `SEED_ALLOW_REMOTE=1`. A sandbox that already installed, made
+  the database and knows it is migrated says so instead of paying for it again: `--no-install`,
+  `MY_APP_BOOTSTRAP_SKIP=<steps>` (any of steps 1–8 by name) and `MY_APP_ALLOW_ROOT=1`
+  (its commands run as root; the container is the boundary) — `SETUP.md` Part 1.
+- **Migrations**: `db:generate` → read the SQL → `db:migrate` (role → migrations → grants).
+  Migrations are forward-only.
+- **Cross-tenant allow-list**: `tests/config/unscoped-allowlist.test.ts` fails a function that
+  queries a `tenant_id` table without naming a tenant. Each exception carries a reason. It does
+  not prove `admin.ts` is the only cross-tenant surface.
+- **RLS** ships inert: every tenant table has `tenantIsolation()` (enforced by `rls-coverage`),
+  and `TENANT_SCOPE_MODE=enforce` waits on the spike in `docs/RLS.md`.
+
+**Known gaps:** the RLS spike has not been run; no read replicas; the local Neon proxy is a
+community image, mirrored to `ghcr.io/rocketflare-dev` and rebuilt with our start script (pinned by digest) — Neon's official "Neon Local"
+needs a cloud account; `neon` in deployment has no read cache and pays a round trip per query
+(p95 is measured per app when it switches, not gated); the seam's guard catches only the
+divergences it knows — a new kind (a driver release that parses something differently) surfaces
+in `kit.yml`'s full-neon pass or in production, not in a copy's gate, whose suite runs `postgres`;
+the proxy image is pulled by every local `pnpm test` (the narrow scripts never pull it); the TEST
+database is pinned to
+5433, so two checkouts cannot run `pnpm test` at once (each app has its own Compose project,
+`<slug>-test`, so switching checkouts no longer recreates the other's container). `--db-url` with a loopback URL (a native
+Postgres) still looks like this checkout's Docker database to preflight and `dev:db:*`, and a
+re-run of the bootstrap without the flag checks for Docker again. The remote target is proven in
+the kit only through the local Neon proxy: against a real Neon branch, the owner role's
+`ALTER ROLE`s on an app role someone else created, the connection count and the time limits are
+the caller's to prove.
+
+## 5. Background work and realtime
+
+**A route never runs long work (D7).** Anything under 30 s total goes to `JOBS_QUEUE`, multi-step
+work goes to `AGENT_RUN_WORKFLOW`, and cron only dispatches.
+
+- **Jobs**: one queue, envelope `{ id, type, payload, enqueuedAt }`, variants are DATA
+  (`CORE_JOB_VARIANTS` + plugin `jobs`). A mapped handler table proves completeness, so there is no
+  switch. `type` is the version seam (`x.v2`). An invalid envelope is acked; a handler error retries
+  with backoff up to `max_retries`. A missing binding throws. Consumers await everything and never
+  use `waitUntil`. Queued today: `tenant.purge`, invitation and access-decision emails,
+  `document.index`/`document.convert`, `chat.compact`. The magic link stays inline.
+  Detail: `.claude/rules/api.md`.
+- **Workflow**: `AgentRunWorkflow` (§9). **Concurrency is a DB claim row, never a `Map`**:
+  `ACTIVE_RUN_STATUSES` (exclusive index, includes parked runs) ⊃ `CLAIMABLE_RUN_STATUSES`
+  (the claim). Keep those two lists separate. A lost instance is settled on read, and there is no
+  sweeper cron.
+- **Cron**: `scheduled.ts` looks up the task by expression. `0 4 * * *` prunes; plugins add their
+  own tasks, and each expression must appear in both tomls.
+- **Realtime (D8)**: `NotificationsHub` DO, one per tenant, stateless, using the hibernation API
+  with RPC publish. `GET /ws` resolves the cookie itself, and refuses an `Origin` outside the same
+  allowlist as CORS and CSRF. Removing a member, signing out, blocking a person, suspending a tenant
+  and the identity provider's removals close the affected sockets (`close{User,Session,Tenant}Sockets`,
+  code 4001). **"DB is the truth, WebSocket is a
+  nudge"**: events carry ids, and the UI invalidates the query-key roots from
+  `REALTIME_INVALIDATIONS`. The `entity` of `entity.changed` IS the query-key root. All nudges go
+  through `services/realtime.ts` inside `defer`, after commit.
+
+**Known gaps:** `/api/admin` paths do not nudge; `notification.read` is never emitted;
+`activity.record` has no producer; the DO 101 upgrade is untestable under Node; no dead-letter
+queue; no vitest-pool-workers smoke project.
+
+## 6. Email and storage
+
+- **Email**: Resend over `fetch`, `sendEmail(...)`, neutral templates. With no key, messages are
+  logged (`[email:dev]`, without the link when `APP_ENV=production`), never errors. The magic link is sent inline; other email is `email.send`
+  jobs.
+- **Storage (D23)**: the `StorageService` seam over the `FILES` R2 binding. Keys are
+  `tenants/<tenantId>/<scope>/<uuid>-<name>`. Bytes stream through the Worker (no presigned
+  URLs). The `files` table is the immutable index and the only thing the browser can name. Writes
+  go object first, then row, and a failed insert deletes the object.
+- **`/api/files`**: upload with per-scope type/size checks (413/415); tenant-scoped read (another
+  tenant's file is 404) with ETag/304; **only allowlisted types render inline, everything else is
+  an attachment**. Uploaders can delete their own files, admins any. A document-owned file is 409
+  `owned_by_document`.
+- **Framing is opt-in per response**: only a route that proved the type (`isEmbeddableMimeType`, PDF)
+  sets `embeddable`, which relaxes `DENY` to `SAMEORIGIN` for that one response. It is set before
+  the 304 early return. Never use a path allowlist for this.
+- A missing `FILES` binding is 503 `storage_not_configured`. `tenant.purge` pages through the
+  tenant prefix and is idempotent.
+
+**Known gaps:** `avatarUrl` is global but the object is tenant-scoped (initials fallback elsewhere);
+re-uploads leave the old object; no listing endpoint, quotas or presigned URLs; unbranded templates.
+
+## 7. UI shell
+
+- **Design tokens (D20)**: two DaisyUI themes in `shared/theme-tokens.css` (read by `ui/index.css` and by public-site stylesheets), where the brand hexes are the only
+  hex values; `contrast.test.ts` gates them. Tailwind scanning is `source(none)` + explicit
+  `@source` lines. A plugin's pages get the `../plugins/**/ui/**` line, and precompiled dependency
+  CSS gets none.
+- **Providers**: ErrorBoundary → QueryClient → Auth → Ability → WebSocket → Router. A global 401
+  clears the cache and redirects to `/login?returnUrl=`.
+- **Guards**: one `RequireGuard` primitive; nav items use the same guard as their page.
+  `/login?as=` dev sign-in only works when the server reports `devLogin` and the email is a seeded
+  account.
+- **Data**: `api-client.ts` parses with shared schemas, there is one hook file per resource, and
+  keys come from `queryKeys`. zustand holds only websocket state. Detail: `.claude/rules/ui.md`,
+  `apps/web/src/ui/CLAUDE.md`.
+
+**Known gaps:** no route preloading; no "system" theme or cross-tab sync; the dev quick-login list
+is hard-coded.
+
+## 8. Analytics
+
+**The `analytics` PLUGIN, opt-in (D31).** `plugins/analytics` in
+`rocketflare-dev/rocketflare-plugins`; `defaultPlugins` is empty, so a fresh clone has no
+dashboards until `/rf-plugin add analytics` (SETUP.md §2.7). Once installed, its docs are its own
+`CLAUDE.md` files. drizzle-cube cubes scope every `sql()` by tenant, dashboards are jsonb `DashboardConfig`s
+restrictable to groups, fact tables rebuild on the `:15` cron, and its cube-isolation test is
+mandatory. The kit core knows nothing about drizzle-cube, and other plugins extend it through
+`analyticsExtensions({...})`. The kit's CI installs it as a canary (`.github/ci-plugins.json`), so a
+kit change that breaks it fails on the kit's pull request.
+
+The kit still owns `activity_events`, the catch-all/`run_worker_first`/Vite-proxy files its
+prefixes must be added to, and the visibility registry it registers into.
+
+**Known gaps (kit side):** `activity_events` has no retention; nothing proves a plugin's cron reached
+the tomls beyond parity between the two files; fact refresh/check need a running server and CLI;
+opting in is a manual `plugin add` — the bootstrap has no flag for it.
+
+## 9. AI layer
+
+Server: `api/services/{ai,agents}/**` (read their `CLAUDE.md`), `services/prompts.ts`,
+`api/workflows/agent-run.ts`. Contracts: `packages/shared/src/ai/*`. Rules: `.claude/rules/api.md`
+§ AI services.
+
+- **One resolver (D17)**: `resolveChat` / `resolveEmbeddings` are the only readers of `ai_configs`
+  / `agent_models` and the only place credentials are decrypted. Chat order: per-agent assignment →
+  tenant default → platform `ANTHROPIC_API_KEY` → **Workers AI `glm-4.7-flash` via `[ai]`** → 503
+  `ai_not_configured`. Embeddings order: tenant → Workers AI `bge-m3` (1024-dim) →
+  `EMBEDDINGS_API_KEY` → 503. Workers AI calls are **billed** to the account; removing `[ai]` from
+  both tomls makes the kit zero-spend. Credentials never leave the server (`hasCredential`), and a
+  stored key stays with the provider and normalised base URL it was entered for: changing either
+  needs the key again; every
+  error is normalised to `AiError` with secrets redacted.
+- **Providers**: `anthropic`, `anthropic_compatible`, `openai`, `openai_compatible`, `workers_ai`.
+  There is no Vercel AI SDK and no Bedrock (a SigV4 adapter behind `ChatClient` is the extension).
+  Workers AI quirks — two response shapes, per-model `tool_choice`/streaming lists, fragmentary tool
+  calls, GLM's own `<tool_call>…<arg_key>` markup passed through unparsed, schema-flattening retry —
+  are in `services/ai/CLAUDE.md`. The floor model was chosen
+  because it can run the *agents*. Defaults: `claude-haiku-5-5`, `gpt-6-luna`.
+- **The request body is per MODEL, not per provider** (`shared/src/ai/models.ts`). Claude 4.5 and
+  earlier take a thinking budget. 4.6+ take `adaptive`. "Off" is `disabled`, Sonnet 5.5's
+  `between_tools`, or no field on models that always think (Opus 5.5, Fable). The Claude API takes
+  no `temperature` (API version `2026-10-21`); an `anthropic_compatible` vendor still gets it.
+  Opus/Sonnet 5.5 and Fable 5.1 refuse a forced tool, so a forced tool becomes a prompt instruction.
+  First-party `openai` speaks the **Responses API** (`store: false`), because
+  Chat Completions cannot call tools on GPT-6 Astra/6.1 Sol, nor on Luna while it reasons.
+  Thinking off there means the lowest `reasoning.effort` the model takes. `openai_compatible` stays
+  on Chat Completions. Reasoning (Claude thinking blocks, OpenAI reasoning items) rides a tool loop
+  as opaque `reasoning` blocks, returned unmodified to the provider that produced it. It is kept
+  in checkpoints and never in chat history. Each adapter recovers ONCE from a refusal the traits
+  misjudged (thinking, sampling, forced tool, effort, a replayed block's signature) and remembers
+  it. So an unknown id costs one call, and it is read as the newest generation.
+- **Kit** (`services/ai/agent-loop.ts`): `runStreamingChat`, `runToolLoop`, `callStructuredTool`, prompt
+  caching helpers. Prompts are code (`PROMPT_REGISTRY`) with per-tenant override rows.
+- **AG-UI is the wire protocol (D28)**: `@ag-ui/core` is pinned exactly and imported only by
+  `shared/src/ai/agui.ts`. The kit emits 15 events plus a `kit.` CUSTOM namespace (apps use their
+  own prefix). It supports SSE (`data:` only, no `event:` line) or protobuf.
+  `POST /api/agui/run` is the `RunAgentInput` endpoint. The server owns the transcript, the client
+  supplies only the new message, and client `tools[]` are refused.
+- **Chat**: owned by `userId`; `chat-turn.ts` is the one implementation behind `/api/chat` and
+  `/api/agui`. Everything that can fail as JSON runs before the stream opens, and stream writes use
+  `streamDatabase(c)`. A cancelled run emits no terminal event. Chat can call the three knowledge
+  tools (`CHAT_KNOWLEDGE_TOOLS`), capped at 6 turns. **Long threads are compacted**: a
+  character-budget window (`CHAT_HISTORY_MAX_CHARS`), with the dropped prefix folded into
+  `conversations.summary` by the `chat.compact` job (compare-and-set). Document cards come from
+  `kit.document` events produced by a pure mapper, so nothing about a card is stored. The admin
+  inspector (`/stats`) is derived per request.
+- **A plugin's chat turn**: `streamChat` (`plugins/api/chat.ts`, §16) streams a conversation the
+  PLUGIN owns — no `conversations` row, no compaction, only the plugin's tools — over the same
+  pieces as chat: `resolveChat` (its `promptKey` may carry an `agent_models` assignment),
+  `runStreamingChat`, `aguiTextSegmenter` + `aguiToolEvents` (the tool half, shared with
+  `chat-turn.ts`), `withAgentTrace`, and `recordUsage` under the plugin's `feature`. Its CUSTOM
+  events are `<plugin id>.…`, checked at emit time. Tests script the platform model with
+  `scriptPlatformChat` (the `AI` binding stub) rather than mocking the resolver.
+- **Agents (D7)**: `POST /api/agents/runs` enqueues (row → Workflow instance → 202); the exclusive
+  index dedupes, per (tenant, agent, `agent_runs.concurrency_key`) — the SLOT a run holds: `''`
+  for an exclusive agent (one per tenant), a caller's `enqueueRun({ concurrencyKey })` to narrow it
+  to one active run per key, NULL for an agent declaring `exclusive: false`, whose rows sit outside
+  the index so any number may be active at once — one person's conversation with an agent, which
+  parks on their answers while others hold conversations of their own. A caller who finds the slot
+  held gets that run back (202, `deduplicated`) only if they may see it; otherwise a bare 409
+  `agent_run_active`, under `?strict=1` too. `enqueueRun({
+  idempotencyKey })` goes further — at most one run EVER per (tenant, agent, key): the run id is
+  derived from the three (`idempotentRunId`, a SHA-256-shaped v8 UUID), so the primary key is the
+  gate and a repeat answers the first run, settled or not; a failed `create()` deletes the row
+  rather than failing it, so the retry can start it. A plugin starts a run from a job, cron, email
+  or public handler with `ctx.startAgentRun` (§16), the same `enqueueRun`. A plugin agent
+  reaches `ctx.interrupt`, the resolved `chatModel` and `storage()` through `AgentCtx` (`@/plugins/api`). The Workflow runs `claim → execute#N → (resume#N | expire#N) → finish`, and
+  **every step name carries its round**, because a repeated name replays the recorded result.
+  A retry resumes: `ctx.checkpoint` keeps the tool-loop transcript and `ctx.once(key, fn)` gives
+  once-per-run effects (a DB unique index; at-least-once with a recorded result).
+- **Human-in-the-loop (#17)**: `ctx.interrupt({ key, spec })` parks the run on
+  `step.waitForEvent`. The key must be stable across attempts. Answering is a compare-and-set on the
+  row, *then* a nudge to the instance (`not_found` → restart as `<runId>-rN`). There are four
+  closed interrupt kinds (approval/choice/input/form). Model-called tools are gated on the tool
+  (`requiresApproval`) before any handler runs, and an approval runs only the call the person was
+  shown: that tool, those arguments (or their edit), once. Chat cannot park a turn, so
+  `runStreamingChat` neither offers nor runs a tool that declares a gate. Artifacts are an upserted
+  table, and steering notes are event rows delivered once.
+- **Decisions (D37)**: `ctx.decide(key, { state, questions })` asks typed questions — `noul`
+  (yes/no), `choice`, `score`, in TypeSafe's own vocabulary — and gets back an answer, a
+  distribution and a `confidence` per question; `ctx.decide.sift` asks the same yes/no of every item
+  in ONE request, `ctx.decide.pick` chooses one item or none. **A question decides what a thing IS;
+  the agent's code decides what follows**, so a threshold is a number in code, not a prompt. Engine
+  order (`resolveDecisions`, the one resolver): tenant `ai_configs(scope='decisions')` (provider
+  `typesafe` — Jev, Settings → AI like any provider, with the same Test button) → platform
+  `TYPESAFE_API_KEY` → the chat model on prompt key `agent-decide`, which reports its own
+  probabilities and is recorded `method: 'llm_self_report'` (uncalibrated, labelled as such in the
+  UI) → 503. Every call is one `agent_run_decisions` row, once per `(run, key)` like `ctx.once`: a
+  re-entered `run()` replays the recorded answer, and the same key with different questions fails
+  the run (`questions_hash` — the policy fingerprint, over the questions and not the state). Each
+  call also writes `ai_usage` (`agent:<key>:decide`), a `decide <key>` span, and a thin `decision`
+  event projected as `kit.agent.decision`; `GET /runs/:id` returns `decisions[]`. `triage-research`
+  is the worked example (screen → triage → answer / not covered / escalate to `research-topic`), and
+  evals score decisions per question with `DecisionJudge` (`expected.decisions`, accuracy + Brier)
+  without a model call. Why: AgentRun-style decomposition — cheap, recorded, separately testable
+  judgments instead of a model turn per decision.
+- **Replay (D38)**: `pnpm web agent:replay <agent> --tenant <slug>` runs the agent's CURRENT code
+  over its settled runs and reports what would change — the change you are about to make, checked
+  against a thousand past cases in minutes, not against production. The replay context answers from
+  the record: `decide` from `agent_run_decisions` (same questions about the same state → `served`;
+  reworded → `drift`; same questions about a different state, because upstream code changed what the
+  decision is about → `stale`), `once` from `agent_run_effects`, `interrupt` from
+  `agent_run_interrupts`; anything the record cannot answer is a MISS (`strict`, the default — no
+  model call at all) or asked for real (`--live`, which also re-runs a `ctx.once(key, fn, { replay:
+  'rerun' })` — a pure model call whose prompt may have changed). `--live` reads the tenant's
+  knowledge base, prompts and model choice as they are TODAY, through the Worker's own resolver —
+  the tenant's configs first, then the Workers AI binding, borrowed through wrangler's
+  `getPlatformProxy` — and warns before starting when knowledge search would be degraded (no
+  provider, or a key where the Worker uses Workers AI: chunks do not record their model, so
+  resolving the SAME tier is the only guard). Each run replays in a READ ONLY
+  transaction and `ctx.db` refuses writes before they are sent (listed, not fatal). Per run: a
+  verdict (`match` / `differs` / `incomplete`), the output diff by JSON path, and each decision's
+  status; exit 1 unless every run matches. `--candidate <file>` replays another definition with the
+  same key — how a compiled variant is proven against the full agent's history. Local script only:
+  no route, no UI. Why: D37 made the judgments recorded; replay makes the CODE around them testable.
+- **Volume (D39)**: exclusivity is the `concurrency_key` slot above (PR #77), so a non-exclusive
+  agent (`triage-research`) runs any number at once. Two tenant-wide gates sit on
+  every enqueue: `AGENT_MAX_ACTIVE_RUNS_PER_TENANT` (default 50, 429 `agent_runs_limit` — a soft
+  cap, counted then inserted) and `AGENT_TENANT_DAILY_COST_USD` (429 `ai_budget_exceeded`).
+  `POST /api/agents/runs/batch` takes up to 100 inputs of one non-exclusive agent (400
+  `agent_exclusive` otherwise), validates each, inserts them under one `batch_id` and makes ONE
+  `createBatch()` call; that call is all or nothing, so on failure each instance is created alone
+  and only the rows that really cannot start are failed (`GET /runs?batchId=`, `my-app agents
+  run <key> --batch x.jsonl`). Inside a run, `ctx.scope(prefix)` namespaces every keyed primitive
+  (`once`, `decide`, `interrupt`, `artifact`, `step` → `prefix/key`; no checkpoint) and
+  `ctx.map(key, items, fn, { concurrency, keyOf })` runs each item as a `once` in its own scope, at
+  most `min(concurrency ?? 4, 6)` at a time: a retry replays the items that finished, the first
+  error stops scheduling, and asks from several items become ONE park. No parent/child runs. Every
+  call through `ctx.chat.client` and `ctx.decide` is metered — one `ai_usage` row carrying
+  `agent_run_id`, awaited as the call returns, so a run cancelled or failed mid-loop has a row for
+  every turn it paid for (issue #2) — and an agent writes no ledger rows (`ctx.recordUsage` for a
+  client of its own); `GET /runs/:id` returns `usage`. The meter checks the run's budget before each call
+  (`meta.budget` over `AGENT_RUN_MAX_TOKENS` / `AGENT_RUN_MAX_COST_USD`, plus the tenant's daily
+  cap; tokens include prompt-cache reads and writes), starting from every earlier attempt's rows; over → `failed`, event code
+  `agent_budget_exceeded`, never retried. Why: "thousands of cases a day" needs many runs, cheap
+  fan-out inside one, and a ledger that can say what each run cost.
+- **Policy (D39, issue #1)**: `meta.policy { maxTurns, maxToolCalls, maxConcurrentToolCalls,
+  maxDurationSeconds, repeatedFailureLimit, onExhaustion }`, passed to `runToolLoop` as `policy`, is
+  how far one run's loop may go; `AGENT_MAX_TURNS` stays the ceiling. Tool calls execute concurrently
+  up to `maxConcurrentToolCalls` (default 4; cap 1 is sequential) even with no policy configured; the
+  remaining limits are opt-in. Every limit counts across attempts — turns and ACTIVE time ride the
+  checkpoint (time parked on a person is not counted), tool calls and the failure streak are read
+  back out of the transcript — and every call in the turn that crosses a budget still gets a result,
+  because the next request must not carry an unanswered `tool_use`. Running out is behaviour the loop
+  owns: `'final-answer'` (the default) makes ONE forced call to the loop's single terminal tool over
+  the transcript (`salvaged: true`; what `research-topic` used to do by hand), and a salvage that
+  fails fails the run; `'fail'` throws `ToolLoopExhaustedError` → `failed`, event code
+  `agent_policy_exhausted`, never retried. **`authorizeTool(call)`** on the same loop is the
+  deny-by-rule half of #3 (`requiresApproval` is the ask-a-person half, #17): a refused call is never
+  gated, never run, and the model is told why.
+- **Reading runs**: `agent_run_events` is the durable log, and AG-UI is a pure read-time
+  projection (`/agui`), also streamed live by tailing `seq` (`/agui/stream`, #7). A read-stream
+  failure emits no `RUN_ERROR` (clients reconnect); `id:` goes on the last frame of a row's group,
+  and reconciliation runs once before the first frame. Payloads never go over the tenant-wide DO,
+  because run visibility is per run.
+- **Knowledge (D18)**: `documents` + `chunks` (pgvector HNSW). Text is ingested inline or by job;
+  uploads go to R2, then `AI.toMarkdown`, then the same indexer. Every text write strips NUL and
+  the other C0 controls except tab / LF / CR (`stripControlChars`, `api/utils/core/text.ts`) —
+  some PDFs convert with NULs, which Postgres refuses (22021); the span store does the same over
+  `ai_spans` (jsonb refuses `\u0000`, 22P05). Search is hybrid dense + lexical
+  (the lexical half matches ANY query word, ranked by `ts_rank_cd` — `anyTermTsquery` — so a
+  sentence's filler words cannot veto it) with RRF, scoped by `AccessScope` (§1).
+  `document-content.ts` is the one text reader behind both
+  the viewer and `get_document`. Agent tools resolve the requester's access at execute time.
+  **External ids (D34)**: `documents.external_id` is unique per `(tenant_id, source)` (partial
+  index, `0016`); an ingest carrying one is an upsert — one `ON CONFLICT` statement, grants
+  replaced, chunks rebuilt (the old chunks go in the upsert's transaction, so a pending or failed
+  re-index never serves the replaced text), a replaced original removed from R2 — so a connector's re-sync never
+  duplicates. Plugins reach it through `ingestDocument` (§16).
+  **Platform documents**: a `documents` / `chunks` row with `tenant_id` NULL is knowledge about the
+  APP itself (a plugin's user guide), readable by EVERY tenant by design. RLS pairs
+  `tenantIsolation()` with a SELECT-only `platformReadable()` policy (`tenant_id IS NULL`), so a
+  scoped connection reads platform rows and can never insert, update or delete one; they are
+  written only on the owner connection by `ingestPlatformDocument` from a job or cron (§16). A CHECK
+  requires `source` + `externalId`, unique among platform rows. They are always embedded, by
+  `resolvePlatformEmbeddings(cfg, env)` (`EMBEDDINGS_API_KEY`, else Workers AI via `[ai]`, else
+  none, and then nothing is written), so every tenant's query meets vectors of one model.
+  `searchChunks` reaches them only when a caller names their sources (`platformSources`, never
+  from a request body). The query is embedded once per model when the tenant's embedder differs,
+  with one dense leg per corpus fused by the same RRF, and the answer reports `semantic: 'used' |
+  'unavailable'`. Every tenant document view (the list, viewer, `/search`, `get_document`,
+  `list_documents`, delete) keeps `tenant_id = $t` and never shows one; `search_knowledge` includes
+  them for the sources `ServerPlugin.knowledgeSources` names, marked `platform`, and chat and agent runs show no document card for one (the documents page cannot open it).
+- **Usage**: one `ai_usage` row per call, costed at write time from the one price table
+  (`shared/ai/pricing`; an unknown model gets `null` and is counted as unpriced). While a cost cap
+  applies to a run the deployment pays for (the platform key or the Workers AI binding), a chat call
+  on an unpriced model is refused before it is made (run event `agent_budget_exceeded`), because its
+  cost could never reach the cap. A tenant's own key is its own spend, so it is not refused.
+- **Tracing (D32, supersedes D16's Langfuse ingestion client)**: `api/observability/`. Every AI call
+  site talks to the `Tracer` seam; the recorder batches ended spans and flushes (in `waitUntil`, or
+  awaited at the end of a stream, step or job) to two sinks: our own **OTLP/HTTP exporter**
+  (`otlp-fetch.ts` — JSON by default, hand-encoded protobuf for backends that take nothing else,
+  e.g. Phoenix; no dependency, no Node API) and the **local `ai_spans` table**, written whether or
+  not a backend is configured (the request path opens its own short-lived client per non-empty
+  flush). Attribute names — OTel GenAI semconv, OpenInference, Langfuse aliases — live in ONE module,
+  `genai-attributes.ts`. Handles nest, and the active span rides `AsyncLocalStorage`, so a tool
+  span (recorded by the kit's single tool runner — every tool, kit or plugin, chat or run),
+  retrieval and embeddings nest without signature changes. **Workflow continuity**: a run's trace
+  id is its uuid's hex and its root span id is derived from it, so each `execute#N` (a separate
+  invocation) is a child of a root the `finish` step records once the run has settled. Covered:
+  chat turns, agent runs, tools, retrieval, embeddings, the `chat.compact` / `document.index` /
+  `document.convert` jobs. `OBSERVABILITY_PRESET` (`langfuse|phoenix|generic`) fills endpoint and
+  auth — existing `LANGFUSE_*` keys migrate with no new secret; content capture is off
+  by default, and `OBSERVABILITY_CAPTURE_CONTENT=true` records prompts, completions and tool I/O in
+  both sinks; `pruneAiSpans` on the nightly cron keeps
+  `OBSERVABILITY_SPAN_RETENTION_DAYS` (14). Read back through `GET /api/traces[/:id]` (`read
+  Trace`, admin+ — spans hold other people's prompts) and `my-app traces list|show`; the
+  `rf-traces` skill teaches an agent to debug from the span tree. Switch recipes: `docs/DEPLOY.md`
+  § Tracing.
+
+  **D32 decisions** (design grilling, 2026-09-25): our own OTLP exporter behind the existing seam —
+  not Cloudflare's native tracing, not the Langfuse SDK · the backend is platform-wide only ·
+  content capture is on by default, with a flag to disable · agent context comes from the CLI
+  reading our own Postgres, not a backend REST adapter.
+- **Evals (D33)**: `apps/evals`, its own workspace package because vitest-evals needs vitest 4 and
+  the kit's suites are on vitest 5. `pnpm eval [suite] [--model x] [--judge-model y] [--compare]`
+  runs `suites/**/*.eval.ts` against the TEST database with real models (the platform
+  `ANTHROPIC_API_KEY` from `.dev.vars`; no key → every suite skips and says why). **Targets are
+  in-process and go through the product's own code**: the chat target drives the real
+  `POST /api/chat/conversations/:id/messages` route (so `prepareChatTurn` decides prompt, history and
+  tools, as in production); the agent target runs `enqueueRun` → `claimStep` → `executeRun` →
+  `finishStep` inline. Each case gets a tenant of its own with its `context` documents ingested, so
+  retrieval can only find what the case put there. Everything a target does runs in
+  `withEvalScope` (`observability/context.ts`), which marks its traces `my-app.eval=true`.
+  **The harness input IS the `EvalCase`** (`shared/ai/evals.ts`: input, messages, context,
+  expected `{ output, rubric, tools, toolsMatch, contains }`, tags, source), so judges read each
+  case's own expectations; `describeCases` attaches to a case only the judges it declares something
+  for, because vitest-evals averages a `null` score as 0. Deterministic judges (`Contains`,
+  `Matches`, `Schema`, `Trajectory` with agentevals' strict/unordered/subset/superset, `Budget`)
+  come first; LLM judges (`Rubric`, `Faithfulness` against what retrieval actually returned,
+  `Reference` = vitest-evals' `FactualityJudge`) run through ONE judge harness that calls the kit's
+  resolver on the `evals-judge` prompt key — so `agent_models` can pin it, `--judge-model` overrides
+  it, and every call is an `ai_usage` row under `evals.judge`. `--provider` / `--judge-provider
+  fireworks|gemini` put the target or judge on a real encrypted tenant `ai_configs` row
+  (Fireworks through the kit's own `fireworks` preset, Gemini as `openai_compatible`), so vendor
+  comparisons also exercise the tenant-config tier. A run is a vitest JSON report in
+  `.evals/runs/<ts>-<sha>.json` (git-ignored), stamped with the sha, models and prompt hashes;
+  baselines are committed per suite (`baselines/<suite>.json`, `pnpm eval:baseline`) and
+  `--compare` exits 1 on a per-case, per-judge drop past `--threshold` (0.1). `pnpm eval:view`
+  prints the score diff between two runs, then serves the vitest-evals report UI (runs, cases,
+  transcripts, judge rationales). The optional `evals.yml` workflow runs it on manual dispatch or a
+  `run-evals` label, outside the gate. How-to: `docs/EVALS.md`; the `rf-evals` skill drives it.
+- **Feedback and promotion (D33)**: thumbs on assistant messages and run output
+  (`POST /api/feedback`, `create Feedback` for every member, on an answer they can READ — another
+  member's thread is a 404, admins included). One row per `(tenant, target, user)` in
+  `ai_feedback`; voting again replaces, the same thumb twice withdraws. Each vote is also a
+  zero-length `feedback` span under the answer's trace root (`my-app.feedback.rating`), shown by
+  `my-app traces show`. AG-UI capabilities now declare `feedback: true` for chat and runs.
+  Admins (`read Feedback`) list the queue (`my-app feedback list --rating down`) and
+  `GET /api/evals/export?messageId|runId` drafts an `EvalCase` — question, history, the passages
+  retrieved, the tools called, the OBSERVED answer as `expected.output`, the feedback — which
+  `my-app evals promote <id> --dataset <name>` appends to a dataset after warning that it is
+  tenant data (it will not write without `--yes` or a confirmed prompt).
+
+  **D33 decisions** (design grilling, 2026-09-25, issue #21): vitest-evals as the runner, in its
+  own vitest-4 package rather than a workspace-wide vitest upgrade or a home-grown runner · targets
+  in-process, through the real route and runtime · no in-app eval UI (JSON runs + the report UI) ·
+  datasets are code; promotion from real traffic and thumbs · the judge goes through the resolver,
+  with a `--judge-model` override · in core, not a plugin · the `rf-evals` skill is a first-class
+  deliverable. The prompt key is `evals-judge` (keys are kebab-case); the ledger feature is
+  `evals.judge`.
+- **Rejected**: Cloudflare's Agents SDK. Per-instance SQLite sits outside RLS, the tenant FK cascade
+  and cross-tenant indexes, and the inbox would need Postgres anyway. One `step.do` per model turn
+  was also rejected: steps are unlimited in wall-clock time, and splitting would force every side
+  effect outside a step to replay.
+
+**Known gaps:** model traits are parsed from the id and hand-kept (`MODEL_TRAITS_CHECKED`), not read
+from the Models API; no `effort` setting (thinking is on/off — on means the model's default); Haiku
+5.5's > 100k-token price tier is not modelled (`pricing.ts` uses the ≤ 100k rate); OpenAI tools are
+sent non-strict; an assistant message's `phase` is not replayed to the Responses API;
+no document summary or thumbnail (the card is an excerpt; Workers cannot rasterise);
+no images inside rendered Markdown (a model's or document's image is shown as a link,
+`MarkdownImageLink`); `charOffset` does not map to PDF pages; no frontend tools in chat and no human approval in chat (a
+tool with an approval gate is available to agent runs only), no `STATE_DELTA`; protobuf has no
+stream cursor; a cancelled run emits nothing rather than AG-UI 1.0's `RUN_FINISHED` `cancelled`
+outcome; no token-level streaming for runs (would need a per-run DO); char-based history budget
+not derived from the model; sliding window defeats prompt caching on long threads; `enqueueRun`
+does not pre-resolve the client; Workers AI forced tools on off-list models are best-effort; no
+rerank, no generated `tsvector`; platform documents cannot be opened with `get_document` (a
+search hit is all a model reads of one), are not re-embedded automatically when the platform
+embedder changes (the next `ingestPlatformDocument` re-indexes; until then they are found
+lexically), and have no admin view; HITL asks cannot be amended, have no
+reminders, and parks are bounded by instance retention (3 days Free / 30 Paid); runs nobody opens
+stay active-looking; no prompt versioning. Volume (D39): the active-run cap is counted, not locked,
+so a burst can overshoot it; a budget is checked BEFORE a call, so a run overshoots by its last
+call and, under `ctx.map`, by the calls in flight; **chat has no spend cap**: the run budgets and the
+daily cap meter agent rows only, so a chat turn on a platform key is bounded by nothing but its turn
+and output-token limits; the daily cap is a UTC day and TypeSafe is unpriced, so decisions count
+toward tokens alone; `map`
+runs inside one step on one DB client (six in flight is the ceiling, and a tool loop inside a scope
+restarts on a retry — there is no per-scope checkpoint); a budget error raised inside a tool
+handler is reported to the model as a tool error rather than stopping the run; no batch UI, no
+per-batch cancel, and a batch's runs are not grouped on the runs page. Policy (D39): when a handler
+raises an interrupt under concurrent execution, in-flight sibling results are discarded and run again
+on resume (extending sequential behaviour where subsequent calls have not yet run); a salvage that
+succeeds and then loses its step is paid for again; `maxDurationSeconds` does not count time
+between the last checkpoint and a crash; a policy reaches a loop only when the agent passes it
+(`runToolLoop` has no registry to read); `authorizeTool` is per loop, not a run- or tenant-wide
+rule. Decisions (D37): no
+zod-schema → questions compiler, the `llm_self_report` fallback is uncalibrated with no vote/logprob
+mode, TypeSafe calls are unpriced (no published rates), no per-agent decisions provider
+(`agent_models` is chat-only), and a `sift` over 100 items is the caller's to batch. Replay (D38): a tool loop's model
+turns are not recorded, so a `runToolLoop` agent (`research-topic`) replays only `--live`; steering
+notes are all handed over at the first call; a run that predates a `once` key misses it; no route
+or UI (a local script over a database URL), and `--live` holds one read-only transaction per run. The demo seed's
+vectors are deterministic, so dense search over seeded docs is noise. Tracing: no per-tenant
+backends (BYO keys via `sealSecret`), no native `tracing.enterSpan`, no metrics export, no
+Langfuse/Phoenix MCP; inline ingest from `POST /api/ai/documents/ingest` is untraced (no active
+span); the backend receives a run's root only at `finish`, so an in-flight run has no root there;
+exported content is capped at 32 000 chars per value. Evals: no in-app eval UI or dataset editor;
+the report UI has no side-by-side view (the diff is `eval:view`'s terminal table); no HTTP targets
+against a deployed instance, no red-teaming, no push to Langfuse datasets; a run that parks on a
+person scores as a miss (an eval cannot answer it); run faithfulness sees each passage's
+600-character event preview; without `EMBEDDINGS_API_KEY` retrieval in evals leans on the lexical
+half of hybrid search; `--provider` knows three vendors (anthropic, fireworks, gemini) and the
+latter two are unpriced; a thumbs vote is a
+zero-length span, not an OTLP span event, and is not traced when the answer's root was pruned.
+
+## 10. Deployment
+
+Two standalone tomls (D6) kept identical in everything code can see by `wrangler-parity.test.ts`.
+Account-scoped names carry `-staging`. Neon uses one project with a branch and role per
+environment; under `postgres` Hyperdrive points at the direct host, under `neon` the Worker's
+`DATABASE_URL` secret holds the pooled one (D35). Tagging `X.Y.Z` (which must equal the root
+version) deploys staging; publishing the Release deploys production. `ci.yml` is ONE gate job — the
+secrets scan, then `pnpm gate` (§4), narrowed to `pnpm gate build` only on a tree Launch already
+gated when `LAUNCH_GATE_APP_ID` is set (§4, "Verified once") — which `deploy.yml` calls only when there is something to
+deploy (`guard`) and the commit has no successful CI run yet — nor, for a version-only bump (the root
+`package.json` `"version"` and nothing else, `release-check.mjs --version-only`), does its one parent:
+a commit is gated once, and the kit's
+own tags (nothing to deploy) finish in seconds with a summary saying why. The kit's renamed-copy
+and default-plugins gates, its porting-note and plugin-API checks live in `kit.yml`, which is
+`kitOnly` — a copy has no such file — and is a pull-request check, never a deploy precondition. `pnpm provision <phase>` / `/rf-provision` automates
+accounts → resources → secrets → deploy over REST. Reference: `docs/DEPLOY.md`, `SETUP.md` Part 3.
+
+**External deployer (opt-in).** A Cloudflare token that can deploy a Worker can bind any resource in
+the account into it, so a CI job holding one can reach other apps' data. With the repository
+variable `DEPLOYER_URL` set, `deploy.yml` holds no Cloudflare token and no database credential: it
+proves who it is with a GitHub OIDC token and hands the dry-run build to a deployer that checks the
+bindings, stores an undeployed version, issues short-lived migration credentials, then activates
+(`scripts/deployer.mjs`; the v1 contract is `docs/DEPLOYER.md`). Unset, the default path is unchanged.
+
+**Build once (deployer path).** Production used to rebuild the tag, so Live never ran the bytes
+Staging validated. Now staging packs its build into `launch-bundle-<tag>.tgz` and attaches it to a
+DRAFT GitHub Release (a draft fires no `release: published`, so nothing promotes early); publishing
+the draft deploys exactly those bytes after `scripts/bundle.mjs` checks the digest, tag, commit and
+tree against the checkout. The bundle is environment-neutral — every binding and var comes from
+the toml the deployer receives — and GitHub Releases stay the external record. No asset → today's
+build (`docs/DEPLOYER.md` → Build once).
+
+**Known gaps:** no release helper beyond `kit:release`; no per-PR previews; no CLI publishing;
+provisioning HTTP calls have not been run end-to-end against live accounts; no automated
+Workers-plan check. The kit ships no deployer, only the client and the contract; the job waits for
+approval on a runner (fine for minutes, wasteful for hours — there is no re-dispatch). A deploy
+dispatched while the pushed commit's CI run is still in progress gates again rather than waiting
+for it. Build once covers only the deployer path, and only a promotion that PUBLISHES the staging
+draft: a new release created for the tag instead has no bundle, so production rebuilds. Every
+upload carries its `digest` and `source` (`bundle` | `build`), but comparing production's digest
+with staging's is the deployer's job (Launch refuses a `bundle` upload that differs), not the
+kit's; a staging dispatch from a branch packs nothing. A failed attach is a warning on a green run, not a
+red one (staging is live), and leaves that tag to build at promotion; unpromoted bundle drafts are
+pruned to the newest `BUNDLE_KEEP_DRAFTS` (5) after each attach.
+
+## 11. CLI
+
+A thin client over `/api/*` using a tenant API key. It parses with shared schemas and never keeps
+a second copy of the contract (D26). `api.ts` is the only `fetch` site. Config lives in
+`~/.my-app/config.json` (0600); `MY_APP_API_KEY`/`MY_APP_URL` override it for CI.
+`--json` is available on every read. `traces list|show` reads the local AI trace store (D32);
+`feedback list` is the thumbs queue and `evals promote <id> --dataset <name>` appends a draft eval
+case to `apps/evals/datasets/` (D33, both admin+). `agents list`, `agents run <key> --input x.json |
+--batch x.jsonl` (chunks of 100, failed lines reported, exit 1) and `agents runs list [--batch id]`
+start and follow runs (D39). Exit codes: 0 ok · 1 error · 2 not logged in ·
+3 forbidden.
+No command prints a full key. Human output shows server text as inert text: `renderTable` cells,
+free-text lines and the logger drop terminal control characters, and colour is applied after that
+(a column's `style`); `--json` is unchanged. Plugins register top-level commands named after their id.
+Detail: `.claude/rules/cli.md`.
+
+**Known gaps:** no device-code flow; one profile at a time; `logout` does not revoke the key; no
+shell completion; not published.
+
+## 12. Shared package
+
+`packages/shared` is private and has no build step: `@my-app/shared/<module>` resolves to
+`src/<module>.ts` (so a plugin entry is `…/plugins/<id>/index`). Contracts come first (D13): a new
+API surface starts here. Allowed imports: `zod`, siblings, type-only `@casl/ability`, and
+`@ag-ui/core` only in `ai/agui.ts` (`shared-imports.test.ts`). It never imports `apps/*`, and
+`src/plugins/**` never imports one of the five composers at runtime (that would create a module
+cycle). Detail: `packages/shared/CLAUDE.md`.
+
+**Known gaps:** no own test suite; no OpenAPI; no contract versioning between web and CLI.
+
+## 13. Upgrading a copy
+
+**A renamed copy with deleted examples still absorbs later kit releases (D27).**
+
+- **`.rocketflare.json`**: kit `{id, repo, version, commit}`, the app's names (`app === null` means
+  "this is the kit", asked only through `readManifest()`), `history[]`, `retiredSurfaces`
+  (never deleted), and the **surface manifest**. Surfaces are `example`, `optional-feature` and
+  `plugin`, each with an anchor file whose existence is its presence (delete the anchor to opt
+  out). Every other path is `neverPort`, `kitOnly`, `manual` or `core`; the kit's own
+  `tests/kit-only/kit-manifest.test.ts` requires 100% coverage — an app's new paths never appear in
+  a kit diff, so a copy owes the manifest nothing for them.
+- **Kit-only files** (`kitOnly`): what is true of the kit repository and of nothing made from it.
+  Its tests (`apps/web/tests/kit-only/**`, vitest project `kit-only`) — porting notes and the root
+  version being the kit's, the release/rename machinery, the maintainer hooks, plugin CI, the
+  manifest's kit-state claims, the Launch conformance checker's own tests, the kit's doc guards —
+  which the kit's gate runs (`pnpm test` names the project only while its directory exists); its
+  workflows (`kit.yml`, `plugin-ci.yml`, `notify-plugins.yml`); its maintainer scripts
+  (`release.mjs`, the two nudges and `nudge-lib`, `default-plugins.mjs`, `install.sh`); and its
+  project files (`CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, the pending porting notes
+  `docs/upgrades/unreleased.md`). `scripts/rename.mjs` deletes them when a
+  copy is born, and with them every package.json script (`kit:release`) and `.claude/settings.json`
+  hook that names one (`stripKitOnlyWiring`, `stripKitOnlyHooks`); it also writes the app its own
+  `SECURITY.md` and drops `retiredSurfaces`. `classifyPath` never ports one (the TARGET kit's list too, and `KIT_ONLY_PATHS` is the
+  floor for a pre-0.15.8 manifest); `tests/config/kit-manifest.test.ts` fails a copy that carries
+  one or a script or hook that calls one, and `kit.yml`'s renamed-copy gate asserts none survive
+  and passes at an app version (`1.2.3`).
+- **The Launch kit contract** (`launch.kit.json`, D36): what the kit calls things and how Launch
+  drives an app made from it — the scaffold (`rename.mjs`, `kitOnly`, `postInit`, the app manifest
+  `.rocketflare.json` whose `kit.id` Launch reads), the two tomls and the `{slug}-{suffix}` naming
+  (with `worker.titles`: `RATE_LIMIT_KV` is titled `<slug>-rate-limit`), the vars and secrets Launch
+  provides, the database roles and migrate command, the health routes, the gate (`Gate`,
+  `pnpm gate --list --json`, `LAUNCH_GATE_APP_ID`, `TEST_DATABASE_*`), `deploy.yml` (deployer
+  protocol v1), the session commands (the bootstrap with `--db-url`, the dev server, its ports and
+  sandbox switches), the upgrade command and skill, and `plugins.defaults` — a MIRROR of
+  `defaultPlugins` above, which stays the source the bootstrap and `kit.yml` read (a kit-only test
+  holds them equal). Its shape is Launch's zod schema (`@launch/shared/kit-manifest`), mirrored in
+  plain JS by `scripts/lib/kit-manifest.mjs`. **A copy keeps it**: Launch reads the app's own for
+  its sessions, gate and releases, so the rename rewrites it through the token map EXCEPT its `kit`
+  block (`renameKitManifest`), and `kit:upgrade` treats it as `manual`. `scripts/kit-check.mjs`
+  (`--exec` also runs the gate list) is the static conformance check Launch applies before a kit
+  can be picked — shared byte for byte with the meta-kit `rocketflare-dev/launch-kit` (one change
+  lands in both) — run by `kit.yml` on the kit and on the renamed `my-app` copy. Its ids rule knows
+  which it is looking at: the kit's KV ids are `<PLACEHOLDER>`s; a copy's may be placeholders or
+  the real ids Launch's `write_config` commits; `--provisioned` (deploy.yml) wants real ids
+  everywhere. **No test judges the checkout it runs in** — config tests travel into every copy,
+  which Launch renames and provisions: the checker's and the manifest shape's tests run on a fixture
+  kit (`tests/kit-only/fixtures/kit-fixture.mjs`, shared with the meta-kit, which also provisions it
+  the way `write_config` does), the toml patcher's on a snapshot of the shipped tomls; the kit's
+  own files are judged by `kit.yml` and `tests/kit-only/` (`launch-kit-manifest.test.ts` checks the
+  VALUES against the bootstrap, the dev server, the tomls and the RLS role).
+- **A copy's version is its own**: the rename restarts the root `package.json` version at `0.1.0`
+  and empties `CHANGELOG.md` (`restartAppVersion`, only while the root version is still the kit's),
+  so an app's releases never read as kit releases. Which kit it came from lives in one place,
+  `.rocketflare.json` `kit.version`; the upgrade never ports the root version or `CHANGELOG.md`
+  (`manual` / `neverPort`), so the two numbers never meet again.
+- **Porting notes** (kit repository only): one `docs/upgrades/X.Y.Z.md` per release (frontmatter +
+  four headings), with `unreleased.md` accumulating. `kit.yml` fails a PR touching
+  `apps/**`/`packages/**` without an entry, and the tag gate refuses a release without one.
+  `pnpm kit:release` writes everything. An app writes none: `kit:upgrade` reads the notes from the
+  kit's mirror, not from the copy's `docs/upgrades/`, and the copy releases by bumping its root
+  version and tagging.
+- **`scripts/upgrade.mjs`**: a blobless mirror in `.upgrade/`. It classifies paths, drops absent
+  surfaces and plugin-owned files, translates through the same `applyReplacements()` as the rename,
+  then patches with `--reject` as a fallback. It **never** applies kit migrations (snapshots are
+  cumulative), writes resource ids into tomls, applies deletions unasked, or ports the root
+  version. The version stamp is written last, only on a clean apply. Every release path is checked
+  before anything is written, a plan run included: one that is not a plain path inside the
+  repository (`scripts/lib/repo-paths.mjs`), is under `.git/`, or reaches an added file through a
+  symlink stops the run.
+- **A copy hears about releases on its own**: a Claude Code `SessionStart` hook
+  (`scripts/kit-update-check.mjs`, in `.claude/settings.json`) compares `kit.version` with the
+  newest tag at `kit.repo` (`git ls-remote`, cached a day in the git-ignored
+  `.claude/kit-update-check.json`; a failed check an hour) and hands Claude one message to relay
+  once per session, with the CHANGELOG summaries and a pointer to `/rf-upgrade`. Copies only, a
+  fresh `startup` only, never in CI, `MY_APP_UPDATE_CHECK=0` to silence; any failure is
+  silence.
+- **The kit reminds its own maintainers too** (kit repository only — both scripts and their hook
+  entries are `kitOnly`, so a copy never runs them): two `PreToolUse` hooks on `git commit` —
+  `changelog-nudge.mjs` (source changed, no `unreleased.md` entry) and `release-site-nudge.mjs`
+  (root `package.json` version changed → update my-app.example.com after tagging). Both answer with
+  `hookSpecificOutput.additionalContext`, because a `PreToolUse` hook's plain stdout reaches only
+  the debug log.
+- **Released history is never rewritten** — every copy pins a commit.
+
+**Known gaps:** a copy pinned before 0.10.1 has no update hook until it upgrades (and
+`.claude/settings.json` is `manual`, so that upgrade must add the hook entry by hand); summaries
+only for a GitHub-hosted kit; tomls and `.dev.vars.example` are diffed, not merged; the reject rate is not
+predicted; pre-manifest copies need `--adopt`; no partial upgrades; nothing checks the adopter ran
+migrations; lockstep plugin releases bump every plugin in a monorepo; a copy on 0.15.7 or older deletes
+its kit-only tests by hand once (its upgrader predates `kitOnly`); a copy renamed before 0.24.0
+keeps the maintainer scripts, `CONTRIBUTING.md`/`CODE_OF_CONDUCT.md` and the two nudge hooks until
+it deletes them by hand (`kit:upgrade` stops porting a `kitOnly` file but never deletes one — that
+release's note lists them); the rename script itself and `rf-adapt` stay in a copy (`neverPort`),
+because Launch's scaffold runs the rename and nothing is left to rename after it; `kit:upgrade` shows
+`launch.kit.json` as a `manual` diff translated through the token map, so a hunk touching its `kit`
+block reads as renamed (keep the kit's id and name); a copy that predates the contract gets
+`kit.id` only by following that release's porting note; `plugins.add` cannot express an entry
+without a `subdir` (`--subdir` refuses an empty value), which no default plugin has today.
+
+## 14. Definition of done for the kit
+
+Kit repository only — the bar the kit itself is held to before a release. A fresh agent can clone and run `bash scripts/bootstrap.sh` with zero credentials and land signed in
+on a populated demo workspace. From there it must be able to:
+
+- rename the copy (`/rf-adapt`)
+- log in by magic link and through the CLI
+- invite a member, switch tenants, approve an access request, including under `single` mode
+- see live refresh from a second browser and queued email
+- upload an avatar
+- stream a chat with persisted usage
+- run, watch live, cancel and HITL-answer agents across a dev restart, with the approved document
+  indexed exactly once
+- ingest, upload a PDF and search it
+- restrict content by group and watch it disappear and reappear live
+- add the analytics plugin (`/rf-plugin add analytics`) and remove it cleanly with `plugin remove`
+- port a later kit release skipping deleted examples
+- toggle the `example-feature` plugin's flag
+- provision and deploy to staging
+
+The full gate stays green at every step. `SETUP.md` is the walkthrough.
+
+## 15. Feature flags
+
+**A feature flag is configuration, not a permission (D30).** Every gate reads the `features`
+**array** (`hasFeature`, `requireFeature`, `{ feature }` nav guards), never CASL. A global admin's
+`manage all` would satisfy `access Feature:x` and expose unreleased surfaces.
+
+- **Two layers**: `FEATURES_ENABLED` in `[vars]` is the fail-closed release gate, consulted only for
+  `environmentGated` flags. Then the admin rollout: tenant override → `on`/`off` → `rollout`
+  percentage → registry default.
+- **Keys are code** (`FEATURES` + metadata). No migration is needed to add one; orphaned rows are
+  inert. The kit ships **no** flag — `example-feature`'s belongs to its plugin — so
+  `featureNameSchema` is a refined string.
+- **`featureBucket` is a wire format**: FNV-1a over `"<key>:<unit>"` mod 100, with golden vectors
+  in `features.test.ts`. It is monotonic (the percentage is never hashed) and independent across
+  flags.
+- Resolved inside the session query, with no extra round trip. Gate every door: API mounts (404
+  `feature_disabled`, not 403), plugin registries, **hooks that create rows**, and nav/routes.
+- Admin UI at `/admin/feature-flags`; a tenant override nudges that tenant.
+  `GET /api/features` / `my-app features list` show effective state.
+- **Rejected**: Cloudflare Flagship. It has no notion of your tenants, whole-object `PUT` loses
+  updates, it has no local store, and the browser SDK needs a token. It fits the kit's own
+  cross-deployment rollouts, not per-tenant entitlements.
+
+**Known gaps:** gated code still ships in the bundle (the server is the protection); no per-user
+forcing or scheduling; platform flips reach open tabs only on their next session fetch; no cache on
+the Bearer path; flags cannot gate pre-tenant surfaces.
+
+## 16. Plugins
+
+**A plugin is a git repository COPIED into an app, never an npm package (D31)**, translated through
+`applyReplacements()` like kit code. Only first-party plugins for now: installing one is as trusting
+as merging a PR. A plugin repo mirrors the host tree and ships **no migration, no toml and no
+`package.json`**. Working guide: `apps/web/src/plugins/CLAUDE.md`, `/rf-plugin`,
+`docs/plugin-api.md`.
+
+- **Outbound**: four published entries (server, UI, shared, CLI). Nothing reaches past them, in
+  either direction between core and plugins.
+- **Inbound**: a plugin imports the host only through **declared entries** and receives everything
+  else as **injected context** (`RequestCtx`, `JobCtx`, `CronCtx`, `ToolCtx`, `AgentCtx`,
+  `WorkflowCtx`, `HookCtx`, `SeedCtx`, `DetachedCtx` — thin adapters over kit internals). Two things
+  cannot be injected and are entries instead: `@/db/schema/kit` (module-scope table helpers,
+  imported by relative path) and the split UI kit (`ui-wiring` for the eager entry, `ui` for lazy
+  pages). Tests use `@testkit/{integration,unit}`, whose builders refuse a database handle not
+  created by `setupTestDatabase`. `tests/helpers/plugins.ts` enforces all of this, and every
+  diagnostic names the replacement import.
+- **Six barrels**, one line per plugin each, written by `pnpm plugin add|remove`: shared, server,
+  schema, ui, worker-exports (DO/Workflow classes reach `worker.ts`), cli. Each exports an `as const`
+  tuple plus a widened list, so an empty kit still typechecks. **Opening a closed set** always
+  follows one pattern: `X = [...CORE_X, ...plugins]`. `ServerPlugin<S>` checks handlers, agents and
+  prompts exhaustively against the plugin's own keys.
+- **Core edits**: a line a plugin needs in a core file outside the barrels (a Vite dev proxy
+  prefix, a resolve alias) is a `coreEdits` entry in its manifest (`{ file, after, lines[] }`) —
+  a plain path inside the repository. `add` inserts it after the anchor, `remove` reverts it byte for byte, `upgrade` applies the new
+  release's list. Never a hand edit. Crons go in `plugin.json` `crons`, written into both tomls by
+  `pnpm provision cloudflare <env>`.
+- **Namespacing**: the id is `^[a-z][a-z0-9-]*$` (never a reserved barrel or host directory name —
+  `api` included) and `^[a-z][a-z0-9-]*$` and namespaces jobs (`<id>.x`), query keys
+  (`<id>:`), `/api/<id>`, CLI commands and CUSTOM events. Never `kit.`. Table prefixes are a human
+  convention; **two plugins declaring the same table is a `plugin check` failure**.
+- **Record**: a `kind: 'plugin'` surface (`source: {repo, subdir, version, commit}`). In the kit or
+  with `--local` it goes in the git-ignored `.rocketflare.local.json`. A kit diff never touches
+  plugin-owned files. A vendored plugin (`example-feature`) upgrades with the kit.
+- **Compatibility is OBSERVED (decision 5c)**: the kit emits a `## Surface ledger` in
+  `docs/plugin-api.md` (generated, diff-checked). A plugin's `uses` is **derived** from its imports
+  by `pnpm plugin export`, and compatibility is the set difference `uses \ ledger`, checked before
+  any file is copied. The one surviving number is a top-level `minKit` floor, compared with the
+  HOST's kit version (`hostKitVersion` in `scripts/lib/manifest.mjs`): `.rocketflare.json`
+  `kit.version` in a copy, whose root `package.json` is the app's own, and the root `package.json`
+  version only in the kit itself. `requires.kit` /
+  `requires.pluginApi` are refused by name. CI proves both ends: `kit.yml` runs the gate with
+  `defaultPlugins` plus `.github/ci-plugins.json` installed (in the kit's own repository only),
+  and plugin repos call `plugin-ci.yml` (floor + newest kit), which installs a plugin's
+  `requires.plugins` from the same checkout first and takes the highest `minKit` across the set
+  as the floor.
+- **Lifecycle** (`scripts/plugin.mjs`): `add` (plan, then `--apply`), `upgrade`, `remove`
+  (`--archive`), `list`, `check`, `export`. Every plan step is **declarative, agent (with its
+  assertion) or human** — a printed instruction is not a mechanism. The host generates the
+  migration (`db:generate --name plugin-<id>-<version>`). `pnpm provision cloudflare <env>` writes
+  a plugin's bindings (`kv|queue|r2|workflow|durable_object|images`), crons, prefixes and vars into BOTH
+  tomls. DO migration tags `plugin-<id>-vN` are append-only.
+- **`plugin check` is an exhaustive oracle**: manifest fields, `minKit`, ledger diff, barrel lines,
+  `*.rej`, migration tag, host dependencies (present, at a range inside the declared one —
+  `add` writes the declared range, never pnpm's `^<resolved>`; `upgrade` installs what a release
+  adds or re-ranges and removes what it drops only when a plugin brought it in — the surface's
+  `addedDependencies` record, never range equality — no other plugin declares it and the host
+  holds exactly the old range — a range a peer plugin cannot use is refused), worker exports, a tenant-isolation test for tenant
+  tables, `onTenantDeleted` for DOs, table collisions, declared skills, and API prefixes missing from a
+  `run_worker_first` a restore marked. Each finding names file, line and exact edit.
+  Structural checks read comment-free code. It runs where a finding can still be acted on: at the
+  end of `plugin add|upgrade --apply` (exit 8 when the tree it wrote fails), in the plugin's own CI
+  (`plugin-ci.yml`) and in `kit.yml` — not in an app's `pnpm gate`, because an undeclared import
+  compiles and passes the tests and only breaks at the next upgrade, where the check stops it first.
+- **Agent tools**: `agentTools(ctx)` may be async and may return `[]`. That is how a tool reaches
+  only the tenants that turned it on: the plugin reads its own settings row for `ctx.scope.tenantId`,
+  or its flag through `ToolCtx.features()` (`example-feature` does — a dark feature then costs no
+  prompt tokens). A builder that throws is logged and skipped. `buildAgentTools` is therefore async.
+  `ToolCtx.can(action, subject)` is the requester's CASL grant, read at build time from their
+  current membership (false for a run with no requester): gate a tool that writes on your own
+  subject's `manage`, not on `scope.bypass`, which is row visibility and true for `support` too.
+  `ToolCtx.requesterUrls` is the frozen set of http(s) URLs the person wrote themselves
+  (`services/agents/tools/requester-urls.ts`): in chat, their own turns in the conversation; in an
+  agent run, the input when a person submitted it through `POST /api/agents/runs` or `/runs/batch`
+  (`agent_runs.input_from_requester`), recomputed on every attempt. A run a plugin or an event
+  started, and a `streamChat` turn, carry none. A tool that fetches the web reads a URL only when
+  it is in this set or its own search returned it, so text from a page, a document, an email or
+  the model cannot point it somewhere the person never asked for.
+- **A streamed chat turn (`streamChat`)**: `streamChat(c, { promptKey, feature, message, history?,
+  system?, variables?, tools?, maxTurns?, signal?, threadId?, onFinish? })` from `@/plugins/api` is
+  a plugin route's whole answer — the kit's resolve seam, streaming tool loop, AG-UI encoder (SSE or
+  protobuf), GenAI trace and `recordUsage`, with none of chat's conversation rows. `promptKey` must
+  be one the plugin registered in `ServerPlugin.prompts` (`promptOwner`), and that plugin's id is
+  the namespace: `feature` is `<id>`, `<id>:…` or `<id>.…`, and `emit(name, value)` — on the tool
+  context and in `onFinish(result, { emit })` — sends a CUSTOM event only when it is `<id>.…`
+  (never `kit.`); any other name ends the run with `RUN_ERROR` `invalid_custom_event`. Tools are
+  the plugin's own, built inside the stream on its database client; gated tools are withheld.
+  Budgets are chat's: `AGENT_MAX_OUTPUT_TOKENS`, `maxTurns` clamped to `CHAT_MAX_TOOL_TURNS`,
+  history trimmed to `CHAT_HISTORY_MAX_CHARS` (`kit.notice history_truncated`), not counted against
+  `AGENT_TENANT_DAILY_COST_USD`. No provider is the JSON 503 before any frame. A plugin test drives
+  it with `scriptPlatformChat` from `@testkit/integration` (§9).
+- **Credentials**: a plugin stores a tenant's key with `sealSecret` / `openSecret` from
+  `@/plugins/api`. That is the kit's AES-GCM under `OAUTH_ENCRYPTION_KEY`, with a 503 when the key
+  is unset. Store the sealed value in a `*_enc` column and answer `hasCredential`.
+- **Public mounts (D34)**: `publicMounts` are routes a third party calls with no session — an
+  admin-consent callback, a webhook. Only under `/api/hooks/<id>` (so no toml edit and one
+  enumerable prefix per plugin), mounted before the authed table with no `authMiddleware` and no
+  gate; `tests/config/plugins.test.ts` refuses one anywhere else and any authed mount there. The
+  handler gets `publicCtx(c)` — no tenant, no auth fields, `enqueue`, `features(tenantId)` — and
+  proves the caller before naming a tenant. `signState` / `verifyState` are the proof for a
+  round-trip the plugin started: HMAC-SHA256 under a key HKDF-derived from
+  `OAUTH_ENCRYPTION_KEY`, a `purpose` that is part of the signed body, an absolute expiry
+  (default 10 min), `null` for every failure. Signed, not encrypted. The host guards every
+  public mount before its router runs (`api/middleware/public-mounts.ts`): a per-IP KV sliding
+  window in a bucket named after the prefix — default 120 / 60 s, `rateLimit: false` to opt out
+  (a webhook sender with fixed IPs that batches), a no-op without `RATE_LIMIT_KV` like every kit
+  limit — and the body cap, chosen at middleware step 5 before any parsing: 1 MB unless the
+  mount declares `bodyLimitBytes` (≤ 10 MB; the config test refuses more), which then replaces
+  it beneath that prefix for every content type, so a ~200 KB SAML form POST or a SCIM bulk body
+  is neither refused nor unbounded. Both are the optional third tuple element,
+  `[prefix, router, { rateLimit?, bodyLimitBytes? }]`; a path is throttled by the longest public
+  prefix it falls under only.
+- **Public sites**: `ServerPlugin.publicSites` serves whole hosts from a plugin's router, for
+  anonymous readers. `hosts(config)` lists the hosts it answers (lowercase, no port); `null` means
+  the plugin's config is bad and it is **dormant**, so every host other than `APP_URL`'s and
+  loopback gets a plain, uncached 503. `api/middleware/public-sites.ts` runs after
+  `databaseMiddleware` and before every mount, and reads the host from the request URL (no
+  forwarded header is trusted). On a matching host the plugin's router answers everything, so
+  `/api/*`, `/auth/*` and `/ws` are never reached there. GET and HEAD are allowed, plus POST on a
+  path declared in `forms`; anything else is 405. The order is cache lookup, router, cache put. Page
+  requests are never rate limited (a form POST is). The cache key is `<host>/<generation>/<path>`, without the query string.
+  `cache` is optional, and its `generation` must not touch Postgres, so a hit costs no query; it
+  returns null to skip caching a request. A cacheable request reaches the router without `Cookie` or `Authorization`, so a cached site is anonymous. Only a 200 with no `Set-Cookie`, and with no `Vary` beyond `Accept-Encoding` and the `cache.variantHeaders` of a request that has a variant, is stored, and HEAD is
+  served from the GET entry. A form POST bypasses the cache and has its own body limit (default
+  64 KiB, at most `MAX_PUBLIC_MOUNT_BODY_BYTES`) and rate-limit bucket. Two plugins claiming one
+  host, or a claim on `APP_URL`'s host, fail the gate (`publicSiteIssues`); at runtime the claim is
+  ignored and logged. A site host always gets the strict public CSP from
+  `api/middleware/security-headers.ts`, on hits and misses alike: no script, frame, connection or
+  form target unless `csp(host, config, pathname)` declares one (`pathname` lets one path carry less
+  than the rest of the host; a `connectSrc` or `formAction` path such as `/submit` is pinned to the
+  request's origin, so one route opens rather than the host), `style-src <request origin>/site-assets/`
+  (the same source joins `script-src` once a site declares any script, so a page cannot load the
+  admin bundle from `/assets/*`; `publicSiteIssues` refuses a declared script source reaching that
+  path, including `'self'`, and at runtime it is dropped) and
+  `frame-ancestors 'none'`. Inline script stays banned: a declared source containing
+  `'unsafe-inline'`, `'unsafe-eval'`, `*`, `data:` or `;` fails `publicSiteIssues` and is dropped at
+  runtime.
+- **The `publicSites` manifest field**: `"publicSites": { "hostsVar": "SITES_HOSTS" }` in
+  `rocketflare-plugin.json` names a var holding a comma-separated list of `host` or `host=anything`.
+  Its presence is what makes `pnpm provision` write `run_worker_first = ["/*", "!/assets/*",
+  "!/site-assets/*"]`, `not_found_handling = "none"` and one route per declared host beside the
+  app's, in both tomls. A missing file under either asset prefix is a plain 404; the SPA catch-all
+  serves `index.html` for a navigation only. Without such a plugin both stay as
+  they were. `plugin add` writes both values and keeps the previous lines in marked
+  comments. When `plugin remove`, or an `upgrade` whose release drops `publicSites`, puts those lines
+  back without API prefixes provisioned since, it marks the list `# my-app:reprovision` and prints
+  a re-provision step; `plugin check` fails while a marked list lacks a plugin's prefixes, and
+  `provision cloudflare` clears the mark. The `images` binding type is declared in the toml and has no resource to create.
+- **`appOwned` paths** (`"appOwned": ["apps/web/src/plugins/<id>/app"]`, inside `paths`): the developer's. `plugin upgrade` never touches them, and `plugin remove` lists a file changed or added since the pinned commit and needs `--force-app-owned` to delete it.
+- **`workspace` route tier**: a `UiPlugin` route with `tier: 'workspace'` renders inside `Layout`,
+  in the shell's route table, for a page that needs the whole space under the app header (an
+  editor canvas). It requires sign-in and a tenant, and its `guard` is honoured, as on `shell`. On a
+  workspace route from `lg` up the sidebar collapses to its icon rail whatever the reader saved,
+  the saved preference is untouched and returns on leaving, and the collapse toggle is hidden;
+  below `lg` the drawer is unchanged. `<main>` has no padding and the page fills the viewport under
+  the 56 px header (`h-full` in a plugin page), scrolling only its own panes. The other tiers are
+  `shell` (the default), `noTenant` and `public`.
+- **Header items (`UiPlugin.header`)**: `{ id, Component, guard?, order?, placement? }[]` adds
+  controls to the top bar — `placement: 'center'` (a search box, in `Layout`'s `headerCenter`) or
+  `'end'` (the default, ahead of the kit's status, bell and user menu). `App.tsx` renders them with
+  `PluginHeaderSlot` for every shell and workspace page, ordered by `order`, then plugin id, then
+  item id; each behind its guard (the same `useNavGuard` semantics as nav and routes), inside its
+  own `Suspense` and error boundary, so a slow or throwing item renders nothing and the shell
+  stands. `Component` is `lazy(() => import(...))` like a page. The host reserves no width and
+  collapses nothing on a narrow screen: an item is a compact control and opens anything large as
+  its own lazy chunk. `headerItemIssues` (`plugins.test.ts`) refuses a duplicate id or an unknown
+  placement.
+- **Destinations (`useNavigationEntries()`)**, from `@/plugins/api/ui`: every place the reader may
+  open as one flat list of `{ id, label, to, group, icon?, keywords?, source }` — the side nav as
+  `SideNav` composes it (`composeNav` over `CORE_NAVIGATION` and every plugin's `nav`), the
+  `/settings?tab=` tabs (the core list in `pages/settings/tabs.ts`, which `SettingsLayout` renders,
+  plus every plugin's `settingsTabs({ can })`, all behind the page's `admin`), and the Home quick
+  links (plugins' `homeLinks`, then the core ones). Each is filtered by `useNavGuard`, the first
+  entry for a path wins, and `source` is `kit` or the contributing plugin's id. It is what a
+  command palette searches; `navigationEntries(plugins, checks)` is the pure half.
+- **UI registries (`UiPlugin.extensions`)**: the browser twin of `ServerPlugin.extensions` — plain
+  data under a key the OWNING plugin names (`global-search.commands`), read with `uiExtensions(key)`
+  (and `uiExtensionSources(key)` for the error message) from `@/plugins/api/ui` and narrowed by
+  that owner's schema. It ships in the main bundle with the UI entry, so data only.
+- **`listAgents()`** from `@/plugins/api`: every registered agent (the kit's and each plugin's) as
+  `{ key, title, description }` — the catalogue `GET /api/agents` serves, for a plugin that lists
+  or searches agents. Loaded at call time, off the API's load path; the caller applies the guard
+  (`read AgentRun`).
+- **`resolveOwnerTenant(db, config, ownerSlug?)`** from `@/plugins/api` finds the tenant that owns a
+  public surface: `getSingleTenant` under `single`, by slug under `multi`. It returns null for a
+  missing slug under `multi`, an unknown slug, and any tenant whose `status` is not `active`. This
+  and the plugin's config parser are the only places a plugin should branch on `TENANCY_MODE`.
+  **Known gap:** under `multi` it matches a slug, and a slug can be renamed or reused, so a tenant
+  that renames or is deleted frees a public host for whoever registers that slug next. Bind by id
+  before tenants can own public sites themselves.
+- **Identity (the identity seam)**: a public handler that has proved a person signs them in with
+  `identityFor(c, id).signIn(...)` — the kit links, admits, applies an `idp` membership and mints
+  the session (§2) and the plugin returns the redirect it answers; it never touches
+  `user_sessions`, cookies or `tenant_users`. **Linking by email is opt-in — decided:** a sign-in
+  (or `upsertUser`) whose email belongs to an account with no link from this plugin is refused
+  (`account_exists`) unless it passes `linkByEmail: true`, which a plugin sets only when it has
+  proved its IdP owns the email's domain (a DNS-verified domain on the connection) — a per-tenant
+  IdP can assert any address, so linking by email alone would let one customer's IdP sign in as
+  anyone. **A subject with no link also needs it to CREATE an account**, with the same
+  `account_exists` either way: otherwise the IdP could reserve an address before its owner arrives
+  and keep a working link to the account they sign in to. A `BOOTSTRAP_ADMIN_EMAILS` address is
+  never created or linked through the seam (admission's `proof: 'plugin'` never earns the platform
+  role either); the operator signs in with a kit method. A suspended tenant is refused on every
+  tenant-taking method: 403 `tenant_suspended`, and `signIn` naming it answers `no_access`. `provisionFor(ctx, id)` is the cookie-free half, from
+  any `PluginContext` (SCIM, a directory sync): `findUser`, `upsertUser` (creates with a link and
+  no session; a block stays; an unverified email never links to an existing account),
+  `setMembership` / `removeMembership` (`source = 'idp'` only, so read-only in the app — 409
+  `idp_managed` — and never an owner, support or manual row), `deprovision` and `listMembers`.
+  **`removeMembership` is the membership only** (the IdP stopped granting the tenant: its sessions
+  are UNPINNED and fall back to another membership); **`deprovision` is a leaver** (SCIM
+  `active: false`): the same removal plus DELETING the sessions pinned to that tenant, answering
+  `{ removed, sessionsEnded, retained }` — `retained` is a manual/owner/support row it left, with
+  its sessions — and `blocked`. **Decided: never global in multi mode** — no `blocked_at`, no
+  other tenant's sessions or memberships, because a tenant's IdP speaks for that tenant only; the
+  person's API keys in that tenant stop authenticating because `validateApiKey` joins the
+  creator's membership there (401). **Decided: in single mode `deprovision` BLOCKS** — the one
+  tenant is the deployment, so the multi-mode reason (the person's other tenants) does not exist,
+  and without a block a magic link, Google, another plugin's sign-in, dev login's `onNoTenant` or
+  the session left with no pinned tenant would let the leaver straight back in. It sets
+  `users.blocked_at` with `blocked_source = 'plugin:<id>'` and deletes EVERY session (keys answer
+  403 `blocked`), answering `blocked: true` — only for a person the IdP speaks for (it just
+  removed their `idp` row, or they carry this plugin's link), never with a `retained` row, and
+  never a global or bootstrap admin (logged: no IdP locks the operator out). The block has a
+  source so reactivation cannot undo an operator: the SAME plugin's `setMembership` (SCIM
+  `active: true`, a role again) lifts a `plugin:<id>` block and nothing else; the admin console's
+  Block writes `manual` (and takes over an IdP block), Unblock clears either, NULL means manual;
+  `upsertUser` and `signIn` never lift one. A tombstone `onNoTenant` checks was rejected: it would
+  close one door of six, where `blocked_at` is already checked by every sign-in, the session
+  middleware and API keys. In single mode every tenant-taking method also accepts only THE tenant
+  (`getSingleTenant`), `tests/api/tenancy-single-identity.test.ts` proves the mode end to end.
+  `tests/driver/identity.test.ts` runs sign-in, provisioning and the single-mode block under both
+  drivers. Every tenant-taking method 404s a missing tenant; the CALLER must have proved its right
+  to that tenant, the `PublicCtx` contract. `loginMethods(cfg)` contributes login-page buttons whose `startPath`
+  must sit under `/api/hooks/<id>/`, and whose `errors` copy is keyed `<id>.<name>` —
+  `plugins.test.ts` fails a stray one, and `GET /auth/methods` drops it with a log. `example-feature`'s dev-only `/api/hooks/example-feature/sso/*` is the
+  worked example.
+- **SSO required (`ssoPolicy`)**: `(db, email, { config }) => Promise<{ required: true; methodId;
+  label?; connectionId? } | null>` — "my connection claims this email's domain; send them to my login method
+  `methodId`". The host asks every plugin once per sign-in attempt and enforces the answer on all
+  of its own methods and on every OTHER plugin's `signIn` (§2); `evaluateSsoPolicy` is pure over
+  the plugin list and `plugins.test.ts` drives it with fixtures (claim, other plugin, throw,
+  malformed answer, undeclared method, break-glass). Keep it to one indexed lookup on the domain,
+  answer `null` for a domain no connection claims, and let a real failure throw (the host fails
+  closed). The host does not verify the domain, end existing sessions or check `provisionFor`.
+  `example-feature/api/sso-policy.ts` claims `@sso-required.example.test`, development only.
+- **Inbound email**: `emailHandlers` route Cloudflare Email Routing mail ("Send to a Worker") to
+  a plugin by the recipient's LOCAL PART — `receipts` takes `receipts@…` and `receipts+tag@…`, `*`
+  is the catch-all — through the Worker's `email` export (`api/email.ts`). The host validates
+  config, opens one DB client, `setReject`s an address nobody claims and rethrows a handler's
+  failure (a temporary failure the sender retries, never a bounce). The handler gets `emailCtx` —
+  `CronCtx`'s shape, no tenant: an address is not an organisation — and owns MIME parsing, sender
+  checks, tenant resolution and storage; it should store, write a row and enqueue. Routing an
+  address to the Worker is a per-zone dashboard step. `plugins.test.ts` refuses two plugins
+  claiming one local part.
+- **A callback completing a signed flow**: `verifyState` proves who minted the state and when, not
+  that they still may. `memberCan(ctx, { tenantId, userId }, action, subject)` from `@/plugins/api`
+  re-reads the membership, role, account block and tenant status now; a public callback calls it
+  right after `verifyState`, with the action and subject the start route guarded.
+- **Background feature checks (D34)**: `JobCtx`, `CronCtx`, `PublicCtx` and `EmailCtx` carry
+  `storage()` (R2 under `tenants/<id>/<plugin id>/…`, purged with the tenant) and `features(tenantId)` — the same resolution as `auth.features`, with no user, so a cron that fans
+  out across tenants can skip the ones whose flag is off. `AgentCtx` and `ToolCtx` carry the same
+  `storage()` (one `filesStorage(env)` behind every context's), keyed under the run's tenant.
+- **Starting agent runs from the background**: the same four contexts carry
+  `startAgentRun({ agentKey, tenantId, input, idempotencyKey?, concurrencyKey?, triggeredBy? })`
+  → `{ runId, status, deduplicated }` — `POST /api/agents/runs` without a request, through the
+  same `enqueueRun` (validation, exclusive slot, active-run cap, daily budget, the Workflow start;
+  each refusal a throw, so a job retries). A job passes an `idempotencyKey` naming the WORK
+  (`receipt:<documentId>`), so a redelivery answers the first run instead of starting a second
+  (§9). `triggeredBy` is the requester whose access the run's tools read; omitted, a system run.
+  It is part of `feature-agents` and reaches the runtime by a function-scope import (the agent
+  registry reads the plugin barrel). `@testkit/unit`'s `makeJobCtx` / `makeCronCtx` /
+  `makeEmailCtx` record every call in `startedRuns` and take a `startAgentRun` replacement.
+- **Plugin events (D42)**: "something happened in a plugin" as a declared, durable, tenant-scoped
+  fact — the way an inbound email is something that happened outside. **Declare** in the shared
+  entry, `events: { '<id>.<thing>.<happened>': zodSchema }` (never `kit.`; listed in `plugin.json`
+  `"events"`; `plugins.test.ts` and `plugin check` refuse a mis-prefixed, colliding or undeclared
+  name), so `EventName` / `EventPayload<E>` are derived types. **Emit** with `ctx.emit(name,
+  { payload, idempotencyKey? })` on `RequestCtx`, `AgentCtx` and `EventCtx` (tenant-bound), or
+  `{ tenantId, payload, … }` on `JobCtx`, `CronCtx`, `PublicCtx` and `EmailCtx`: it validates the
+  payload (400), writes one `plugin_events` row (deduplicated per `(tenant, name, key)`; an emit
+  that recorded but never queued is re-queued by the same key), then queues ONE `event.deliver`
+  job per subscriber carrying ids only — it never runs a handler. The payload is kept
+  `EVENTS_RETENTION_DAYS` (7, the nightly `pruneEvents` task), purged with the tenant, re-read and
+  re-validated under the tenant predicate on delivery, and never logged. **Subscribe** with
+  `ServerPlugin.eventHandlers: [{ event, name, handle(event, ctx) }]` (adapt with `eventCtx(ctx)`:
+  tenant-bound `emit`, `enqueue`, `nudge`, `features()`, `storage()`, `startAgentRun`,
+  `startBoundAgent`) or, for a copy's own code, `APP_EVENT_HANDLERS` in
+  `apps/web/src/api/services/events/app-handlers.ts` (app-owned: `kit:upgrade` never ports it).
+  A throw retries that subscriber alone (the jobs backoff); a 4xx `ApiError` is logged and acked.
+  **Agent triggers**: `AgentDefinition.triggers: [eventTrigger(event, { where?, input })]` starts
+  a run per matching event through `enqueueRun` (input schema, exclusive slot, active-run cap,
+  daily budget), idempotent per (event, agent) via the run key `event:<eventId>`; the run records
+  `trigger_event` / `trigger_event_id`, the runs page and run page show the event, and the
+  `agent_run.requested` activity row says `via: 'event'`. **Bindable agents** (a no-code "On
+  submit, start" picker): an agent opts in with `bindable: [eventBinding(event, { input })]`;
+  `GET /api/agents/bindable?event=` (any member) and `listBindableAgents(event)` list them;
+  `EventCtx.startBoundAgent(key)` starts one for the DELIVERED event and re-checks the opt-in on
+  the server — an unknown key, a plain agent and a merely triggered one are all 403
+  `agent_not_bindable`, so a forged key starts nothing. `@testkit/integration`'s
+  `deliverEvents(env, db)` runs the queued deliveries through the real consumer. Worked example:
+  `example-feature` (`POST /notes` emits `example-feature.note.created`, `events/note-created.ts`
+  audits it, `agents/note-stats.ts` is triggered unless the title starts "draft", and bindable).
+- **Knowledge ingest (D34)**: `ingestDocument` / `ingestDocumentFile` / `deleteIngestedDocument`
+  over the kit's ingest paths (§9). With an `externalId`, the same `(tenant, source, externalId)`
+  UPDATES the row — text, owner, visibility, grants, chunks, the stored original — so a sync can
+  replay safely. Group ids are checked against the tenant first. This file belongs to the
+  `feature-knowledge` surface; a plugin that ingests requires it.
+- **Platform knowledge**: `ingestPlatformDocument(ctx, { source, externalId, title, text })` /
+  `prunePlatformDocuments(ctx, { source, keepExternalIds })` write the tenant-less corpus (§9).
+  They take ONLY `JobCtx | CronCtx`, which now carry `kind: 'job' | 'cron'`, so the structurally
+  identical `EmailCtx` and `PublicCtx` are a type error, and they check at run time too. The
+  `source` must be `<installed plugin id>:<kind>` (never `kit:`). Ingest embeds synchronously with
+  the platform embedder, throws `PlatformEmbeddingsError` (503) with nothing written when there is
+  none, and returns `unchanged` for the same title and text. `searchKnowledge(ctx, { query, limit,
+  sources?, platformSources?, signal? })` → `{ hits, semantic }` works from any context with a
+  `scope` and falls back to keyword search. `ServerPlugin.knowledgeSources?(scope)` adds platform
+  sources to the kit's `search_knowledge` tool (unioned; an unnamespaced source is dropped, a throw
+  skipped). `fuseByRank` / `anyTermTsquery` / `candidatePoolSize` are exported for a plugin's own
+  corpus. **Never put tenant data in a platform document**: every organisation can read it.
+- **Skills**: a plugin ships agent skills at `skills/<dir>/` in its own tree and declares them in
+  `"skills"`; `add` copies each to `.claude/skills/<dir>/` (the one place outside its roots a
+  plugin may write) and records it on the surface, `upgrade` REPLACES it (never patches — an agent's
+  instructions are the plugin's outright), `remove` deletes it. `<dir>` is `<id>` or `<id>-*` and
+  its SKILL.md `name:` equals it, so a plugin skill can never shadow a kit `rf-*` one; an existing
+  directory is a refusal. `plugin check` fails a declared skill that is missing, misnamed or
+  undescribed, and a directory in the plugin's namespace it does not declare. `.claude/` in a
+  plugin repository stays that repository's own tooling. `example-feature` ships one.
+- **Claude Code hooks** (`claudeHooks`): `{ "<Event>": [{ command, matcher?, timeout? }] }`, merged
+  by `add` into the host's `.claude/settings.json` (created if absent) as one matcher group per hook
+  at the end of its event; `upgrade` replaces them and `remove` takes out exactly them, so a round
+  trip is byte-identical (and deletes a file `add` created). The command may only be
+  `node "$CLAUDE_PROJECT_DIR/.claude/skills/<dir>/<script>"` plus plain flags, over a script one of
+  its declared skills ships: a hook runs in the developer's coding agent, so it can run nothing the
+  plugin does not ship and `remove` does not delete. That skill directory is also what identifies
+  the plugin's entries (the longer id wins on a shared prefix). `plugin check` fails a declared hook
+  missing from the file, an undeclared one in the plugin's namespace and a missing script.
+  **Known gap:** `.claude/settings.json` is `manual` in `.rocketflare.json`, so a kit release
+  changing the kit's own hooks reaches a copy as a hand merge, as before.
+- **Host files** (`hostFiles`): `[{ path, from }]`, a file or directory the plugin SEEDS for the
+  developer under `docs/<id>/`, `apps/web/public/<id>/` or `apps/web/src/host/<id>/` (nowhere
+  else). `add` copies only what is absent; `upgrade` never touches one, and seeds only an entry the
+  release adds; `remove` leaves them and lists them. The surface records them in `hostFiles`,
+  outside `paths`, so the kit's file classification knows whose they are and `remove` deletes none.
+  A plugin imports its own `apps/web/src/host/<id>/` as `@/host/<id>/…` (the existing `@/*` alias),
+  and only its own id's (`tests/helpers/plugins.ts`). **Known gap:** `plugin export` does not write
+  host files back to `from` — they are the app's content, not the plugin's.
+- **Hooks** (`onTenantCreated`, `onTenantDeleted`, `seedDemo`) run post-commit, are idempotent,
+  and are try/caught. DO state is purgeable only through instance names **derived** from the tenant
+  id.
+- **Traps measured, now rules**: registries a plugin composes into are FUNCTIONS, not consts
+  (module-evaluation order); a value a plugin needs moves to a leaf module; browser-read registries
+  are separate files from composing ones; plugins declare `relations()` for their own tables only
+  (drizzle type intersection); annotate `const ctx: RequestCtx` so `never` narrows.
+- **`example-feature`** is the vendored reference that exercises every slot. It exists to be
+  deleted.
+
+**D31 decisions** (cited by number in code comments):
+
+| # | Choice |
+|---|---|
+| 1 | First-party only; the install plan waits for a human |
+| 2 | The kit is bare; `defaultPlugins` + a bootstrap step install an app's own set on its fresh clones (empty in the kit: analytics is opt-in) |
+| 3 | `example-feature` is the reference plugin |
+| 4 | A plugin is recorded as a `kind: 'plugin'` surface; `readManifest()` is the one kit-vs-app predicate |
+| 5 | Compatibility is proved in CI from both ends (`kit.yml` with `defaultPlugins` + `ci-plugins.json` installed; `plugin-ci.yml`; `kit:release` refusal) |
+| 5b | *(reversed)* a `PLUGIN_API` integer beside `requires.kit` |
+| 5c | Compatibility is observed: derived `uses` against the emitted ledger, plus a `minKit` floor |
+| 6 | Cubes/fact tables/dashboards are plugin-owned registries via `extensions`, narrowed by the owner |
+| 7 | Analytics extracted with no compatibility path (tables become `analytics_*`) |
+| 8 | Pages are `lazy()`, proved by a source-level test |
+| 9 | Four published entries; deep imports fail in either direction |
+| 10 | Phase A shipped as four PRs, one release |
+| 11 | Uninstall drops tables by default, `--archive` on request |
+| 12 | Provisioning writes plugin bindings into both tomls (`kv`/`queue`/`r2` created; `workflow`/`durable_object`/`images` declared) |
+| 13 | Every manifest has a required `repo` |
+| 14 | The inbound surface is injected context (the `*Ctx` family), not imported symbols |
+| 15 | What cannot be injected is a declared entry (`@/db/schema/kit`, split UI kit, `@testkit/*`) |
+| 16 | A printed instruction is not a mechanism — hence the worker-exports barrel |
+| 17 | DO migration tags are append-only and host-owned |
+| 18 | Out-of-Postgres tenant state is purged via `onTenantDeleted` over derived DO names |
+| 19 | Test builders refuse a fake database |
+| 20 | Every plan step is declarative, agent or human (`kind` in `--json`) |
+| 21 | `plugin check` is an exhaustive, untiered oracle that reads comment-free code |
+| 22 | Table prefixes are convention; collisions are the check |
+| 23 | A plugin ships agent skills: `skills/<dir>/` → `.claude/skills/<dir>/`, namespaced by id, replaced on upgrade |
+| 24 | Inbound email is a slot keyed by local part; the host dispatches and rejects, the plugin parses, authenticates and stores |
+| 25 | A background context starts an agent run through the route's own `enqueueRun`; idempotency is a derived run id, not a new column |
+| 26 | Plugin identity is `identityFor(c, id)` / `provisionFor(ctx, id)`, links under `plugin:<id>`, memberships through the core `idp` primitives; login buttons are declared, never rendered by the plugin |
+
+**D42 decisions** (plugin events and agent triggers):
+
+| # | Choice |
+|---|---|
+| 1 | Events are declared in the shared entry (zod), namespaced `<id>.`, never `kit.`; the registry is server-side, derived from the shared barrel |
+| 2 | Emit records then queues; one delivery job per subscriber, ids only; the payload lives in `plugin_events` for `EVENTS_RETENTION_DAYS` |
+| 3 | Emit on a tenant-bound context takes no `tenantId`; only the background contexts name it |
+| 4 | A trigger and a binding start through `enqueueRun` with the key `event:<eventId>` — at most one run per (event, agent) |
+| 5 | `triggeredBy` stays a person; the event is its own two columns on `agent_runs` |
+| 6 | A bound start is a method on the DELIVERED event's context, so neither the event nor its tenant can be forged, and the opt-in is re-checked there |
+| 7 | A subscriber's 4xx refusal is acked; anything else retries that subscriber only |
+
+**Plugin events known gaps (D42):** an app cannot DECLARE events of its own (it only subscribes,
+through `APP_EVENT_HANDLERS`); emit is not transactional with the caller's write (emit after the
+row is stored, with a key naming it); a binding has no `where`; there is no event log UI and no
+replay of a pruned event; subscribers run in queue order, with no ordering guarantee between
+events.
+
+**Known gaps:** no sandbox, review or signing; no rename migrations (expand/contract only); no
+cross-plugin FK tooling or `many()` onto core tables; `grants` is additive by convention only;
+provisioning never deletes resources and never creates an Email Routing rule; `d1`/`vectorize`/`analytics_engine` bindings are refused;
+the ledger judges only ledgered entries, ignores namespace imports, truncates types over 300
+chars, and `uses` is only as fresh as the last export; table collisions are caught by `check`, not
+refused at `add`; the isolation check proves a test exists, not that it is right; no database-free
+test of data-touching handlers; one DO per row is unpurgeable (purge-intent ledger not built);
+`plugin-ci.yml` input changes reach callers only via `main`, and nothing tests versions between
+floor and ceiling. `addedDependencies` starts after 0.17.1: a plugin installed by 0.17.1 or earlier has its
+older packages kept, never removed, when a release drops them, and a package a plugin added that
+the kit later starts declaring too is still the plugin's to remove. Public mounts (D34) have no `@testkit` builder
+(test them through `request()`), and their rate limit is the kit's approximate KV window, keyed
+on the client IP — a sender behind a shared egress shares one bucket; `verifyState` has no replay ledger — a token is reusable until it
+expires, so a plugin whose callback must run once records that itself; an ingested document's
+upsert reads the previous row before writing, so two racing re-ingests of a FILE may leave one
+replaced original behind in R2; a plugin skill edited in place is overwritten by the next
+`plugin upgrade` (copy it to a skill of your own first), and `check` validates a skill's name and
+description, not what it says — a stale command in a SKILL.md is caught only by reading it.
+`startAgentRun`'s `idempotencyKey` is forever per (tenant, agent, key) — there is no expiry, so a
+plugin that wants to re-run the same work later must vary the key; `RequestCtx` has no
+`startAgentRun` (a route calls `POST /api/agents/runs`, or enqueues a job that does). `streamChat` stores no turn (the plugin owns
+its history and sends it back), has no feedback thumbs (its STATE_SNAPSHOT says `feedback: false`),
+no summary of a trimmed history and no daily cost cap; a CUSTOM name a TOOL refuses still reaches
+the model as that tool's error result before the run ends. Header items get no overflow menu: on a
+narrow screen each plugin keeps its own control compact.
+
+---
+
+## 17. Connectors
+
+An **organisation connection** to Microsoft 365 or Google Workspace (D34): an org admin grants an
+operator-registered app access to the whole directory, calendars and — later — mail and files, and
+My App syncs them into the tenant. It is **not login** (§2): a different app, a different
+grant (admin consent / domain-wide delegation, app-only tokens), a different subject (the
+organisation, not the signer). The design, operator and customer-admin setup, phases and the MCP
+assessment are in `docs/CONNECTORS.md`.
+
+It ships as plugins, not core: the `connectors` base plugin (installations, connections, sync
+cursors, the settings tab, the sync job and cron) and one provider plugin each (`m365` first,
+`google-workspace` next), registered through `extensions.connectorProviders`. The kit's part is
+four generic seams on the plugin surface (§16): public mounts at `/api/hooks/<id>`, `signState` /
+`verifyState`, `ingestDocument` with an `externalId` upsert (§9), and `features(tenantId)` off the
+request.
+
+| # | Choice |
+|---|---|
+| 1 | Login and connection stay separate apps, even in production |
+| 2 | One operator-registered app per deployment by default; a per-customer BYO app is the escape hatch |
+| 3 | The data model covers all three usage models from day one: installation → connection with `ownerType` `tenant` or `user` |
+| 4 | Org-wide app-only ships first; per-user delegated is phase 4 |
+| 5 | Directory + calendar by delta polling first — no restricted scopes, so no Google CASA gate |
+| 6 | Webhooks only ever trigger a delta fetch; polling stays the backstop |
+| 7 | Every synced row carries its owner; tenant isolation alone is not enough inside one organisation |
+| 8 | Vendor MCP servers are not a data plane (delegated only, no delta or webhooks) — at most a later chat-tool adapter |
+
+**Known gaps:** no webhooks yet (phase 2); no mail or file ingestion (phase 3); no per-user
+delegated connections or refresh-token rotation (phase 4); Google Workspace provider not built;
+M365 uses a client secret, not a certificate assertion; no Exchange RBAC-for-Applications scoping
+script; synced private rows are still readable by tenant admins (D29 owner-and-admins); the kit has
+no MCP client; directory sync does not provision kit users or groups (it only matches by email).
+
+TypeSafe (Jev) is NOT a connector in this sense: it answers questions rather than syncing an
+organisation's data, so it is an AI provider in the `decisions` scope (§9, D37).
