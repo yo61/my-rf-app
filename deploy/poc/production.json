@@ -1,0 +1,21 @@
+{
+  "cloudflare": {
+    "workerName": "my-app",
+    "vars": {
+      "APP_ENV": "production",
+      "APP_URL": "https://my-app.mra-poc-client.workers.dev",
+      "TENANCY_MODE": "single",
+      "SIGNUP_MODE": "invite_only",
+      "DATABASE_DRIVER": "neon"
+    },
+    "bindings": {
+      "FILES": { "type": "r2", "bucket": "my-app-files" }
+    },
+    "secrets": ["DATABASE_URL"]
+  },
+  "neon": {
+    "projectId": "withered-voice-70748795",
+    "branch": "production",
+    "database": "neondb"
+  }
+}
