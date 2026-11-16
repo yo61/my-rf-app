@@ -1,0 +1,45 @@
+/**
+ * Status logger. Everything here goes to STDERR so `--json` stdout stays pipe-clean.
+ * `debug` lines appear only when `MY_APP_DEBUG` is set.
+ */
+import chalk from 'chalk'
+import { PREFIX } from './brand'
+import { neutralise } from './output'
+
+export interface Logger {
+  info(message: string): void
+  success(message: string): void
+  warn(message: string): void
+  error(message: string): void
+  /** Secondary guidance under an info/error line, dimmed. */
+  hint(message: string): void
+  debug(message: string): void
+}
+
+export interface LoggerOptions {
+  write?: (line: string) => void
+  debug?: boolean
+}
+
+export function createLogger(options: LoggerOptions = {}): Logger {
+  const write = options.write ?? ((line: string) => process.stderr.write(`${line}\n`))
+  const debugEnabled = options.debug ?? false
+  const inert = neutralise
+  return {
+    info: message => write(`${PREFIX} ${inert(message)}`),
+    success: message => write(`${PREFIX} ${chalk.green('✓')} ${inert(message)}`),
+    warn: message => write(`${PREFIX} ${chalk.yellow('!')} ${inert(message)}`),
+    error: message => write(`${PREFIX} ${chalk.red('✗')} ${inert(message)}`),
+    hint: message => write(chalk.dim(`  ${inert(message)}`)),
+    debug: message => {
+      if (debugEnabled) write(chalk.dim(`[debug] ${inert(message)}`))
+    },
+  }
+}
+
+/** A logger that records lines instead of printing — for tests. */
+export function createMemoryLogger(debug = false): Logger & { lines: string[] } {
+  const lines: string[] = []
+  const logger = createLogger({ write: line => lines.push(line), debug })
+  return Object.assign(logger, { lines })
+}

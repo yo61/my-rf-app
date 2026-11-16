@@ -1,0 +1,64 @@
+/**
+ * In-app notifications: list, unread count for the bell, mark read. The list query uses the
+ * `unreadOnly=true` parameter from `notificationListQuerySchema`. The websocket store
+ * invalidates `queryKeys.notifications.all`; the count also polls quietly.
+ */
+import {
+  type MarkNotificationsReadRequest,
+  notificationSchema,
+  unreadCountSchema,
+} from '@my-app/shared/notifications'
+import { paginatedResponse } from '@my-app/shared/pagination'
+import {
+  keepPreviousData,
+  queryOptions,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
+import { api } from '@/ui/lib/api-client'
+import { cleanFilters, queryKeys, toSearchParams } from '@/ui/lib/query-keys'
+
+export const notificationsResponseSchema = paginatedResponse(notificationSchema)
+
+export interface NotificationsFilters {
+  page?: number
+  pageSize?: number
+  unreadOnly?: boolean
+}
+
+export function notificationsQueryOptions(filters: NotificationsFilters = {}) {
+  return queryOptions({
+    queryKey: queryKeys.notifications.list(cleanFilters(filters)),
+    queryFn: () =>
+      api.get(`/api/notifications${toSearchParams(filters)}`, {
+        schema: notificationsResponseSchema,
+      }),
+    placeholderData: keepPreviousData,
+  })
+}
+
+export function unreadCountQueryOptions() {
+  return queryOptions({
+    queryKey: queryKeys.notifications.unreadCount,
+    queryFn: () => api.get('/api/notifications/unread-count', { schema: unreadCountSchema }),
+    refetchInterval: 60_000,
+  })
+}
+
+export function useNotifications(filters: NotificationsFilters = {}) {
+  return useQuery(notificationsQueryOptions(filters))
+}
+
+export function useUnreadCount() {
+  return useQuery(unreadCountQueryOptions())
+}
+
+export function useMarkNotificationsRead() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (body: MarkNotificationsReadRequest) =>
+      api.post('/api/notifications/read', body, { showErrorToast: true }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: queryKeys.notifications.all }),
+  })
+}

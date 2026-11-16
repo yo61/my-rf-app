@@ -1,0 +1,30 @@
+{
+  "name": "@my-app/evals",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Developer-run eval suites for the app's chat and agents (vitest-evals on vitest 4, in-process targets over apps/web). Run locally with `pnpm eval`; never part of the gate.",
+  "type": "module",
+  "scripts": {
+    "eval": "node scripts/eval.mjs run",
+    "eval:baseline": "node scripts/eval.mjs baseline",
+    "eval:view": "node scripts/eval.mjs view",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run --config vitest.unit.config.ts"
+  },
+  "dependencies": {
+    "@my-app/shared": "workspace:*",
+    "drizzle-orm": "^0.45.4",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@neondatabase/serverless": "^1.2.0",
+    "@types/node": "^26.6.6",
+    "dotenv": "^18.0.9",
+    "postgres": "^4.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.12",
+    "vitest-evals": "^0.17.0"
+  }
+}

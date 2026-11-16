@@ -1,0 +1,210 @@
+# My App
+
+Multi-tenant SaaS starter for internal tools and B2B products, a **pnpm workspace**: Hono API + React UI in one
+Cloudflare Worker (`apps/web`), a CLI (`apps/cli`), private zod contracts
+(`packages/shared`). `AGENTS.md` symlinks here.
+
+> **How it works**: `docs/CONCEPTS.md` — one section per subsystem with its known gaps. **Check it
+> before assuming a capability exists; update it when you change one.**
+> **Setup**: asked for setup help → run `/rf-setup` (it drives `scripts/bootstrap.sh --no-dev`, then
+> starts the server): show each `✔ n/10` line, stop on failure. By hand: `SETUP.md` Part 1.
+> **Fresh copy?** `/rf-adapt <slug>`, then `docs/ADAPTING.md`. `/rf-setup`, `/rf-adapt`, `/rf-preflight`, `/rf-how-do-i`,
+> `/rf-upgrade`, `/rf-traces`, `/rf-evals`, `/rf-agent-replay`, `/rf-agent-docs` and `/rf-plugin` you
+> may run yourself; **`/rf-provision` is user-invoked only** (it creates paid resources and prompts for
+> tokens on a TTY) — asked to deploy, tell the user to run `/rf-provision`.
+> **Plugins** (D31, `docs/CONCEPTS.md` §16): a plugin is a git repository copied in, wired through six
+> barrels — `pnpm plugin add|upgrade|remove|list|check`, driven by `/rf-plugin`, which always shows the
+> plan before `--apply`. It imports the host only through the DECLARED entries (`docs/plugin-api.md`,
+> generated and diff-checked) and receives everything else as injected context. `defaultPlugins` in
+> `.rocketflare.json` is what a fresh clone installs (bootstrap step `6/10 plugins`; kit: `[]`).
+> **Copies of the kit upgrade.** `.rocketflare.json` records the kit version, the app's names and the
+> manifest of replaceable surfaces; `/rf-upgrade` ports later releases into a copy and never
+> recreates a surface whose anchor file is gone. **In the kit repository only** (`.rocketflare.json`
+> `app` is null): a behaviour change needs an entry in `docs/upgrades/unreleased.md` in the same
+> commit — `kit.yml` fails without one — and `pnpm kit:release <version>` cuts the release. **In an
+> app** neither exists (the rename removes them): never write a kit porting note; release by bumping
+> the root `package.json` version and tagging it, and keep your own `CHANGELOG.md`.
+
+## Stack
+
+- **Runtime**: Cloudflare Workers (`nodejs_compat`); one Worker exports `fetch`+`queue`+`scheduled`
+  + DO/Workflow classes (`src/worker.ts`). Node 26, pnpm 10
+- **API**: Hono 4, zod contracts from `@my-app/shared`, CASL. **DB**: Postgres 17 + pgvector —
+  Docker locally; deployed, `DATABASE_DRIVER` (D35) picks Drizzle over the Neon serverless driver
+  (`neon`, HTTP + a WS pool for transactions — the kit's tomls) or `postgres.js` via Hyperdrive
+  (`postgres`, any Postgres — a missing var, and local/`.dev.vars`); `openDatabase(env)`, 1 client/request;
+  raw results only through `rows()`/`affected()`
+- **Auth**: openid-client (Google, Microsoft, any OIDC issuer — jose-verified `id_token`, off by default) + magic link + dev-login; `__Host-session`; API keys; KV rate limit
+- **Async / realtime**: Queues (`JOBS_QUEUE`), `NotificationsHub` DO `/ws`, R2 (`FILES`), cron, Workflows
+- **AI**: `services/ai/resolve` (`agent_models` → tenant `ai_configs` → platform key → Workers AI via
+  `[ai]`, zero key → 503); Anthropic / OpenAI-compatible / Workers AI chat streamed as **AG-UI**
+  (`@ag-ui/core` pinned; SSE or protobuf; `POST /api/agui/run` is the protocol endpoint), chat calls
+  the knowledge tools, agents on `AGENT_RUN_WORKFLOW` (projected to AG-UI on read) with typed
+  decisions (`ctx.decide`, D37: TypeSafe's Jev as the `decisions` scope, else the chat model),
+  Workers AI → pgvector (uploads: R2 → `AI.toMarkdown` → pgvector), OTLP tracing (D32: GenAI
+  spans → Langfuse/Phoenix/any backend, always also `ai_spans` → `my-app traces`); evals (D33:
+  `apps/evals`, vitest-evals on vitest 4, `pnpm eval`, never in the gate) + thumbs feedback →
+  `my-app evals promote`
+- **Analytics**: not core — the opt-in `analytics` PLUGIN (D31, `/rf-plugin add analytics`; the
+  bootstrap skips it): drizzle-cube at `/cubejs-api`+`/mcp`, `:15`-cron fact tables, dashboards
+- **UI**: React 19 + Vite, DaisyUI 5 / Tailwind v4, React Router 7, TanStack Query 5; served as `ASSETS`
+- **CLI**: commander + chalk + open; `tsx` in dev, `tsc` → `dist/cli.js` (bin `my-app`)
+- **Tests**: vitest projects `api` · `api-isolated` · `driver` · `ui` · `config` · `kit-only` (the kit's own
+  tests, `apps/web/tests/kit-only/`, deleted by the rename — never in a copy) (Postgres :5433; the
+  suite under `postgres`, then `driver` — the seam's conformance suite — under `neon` through the
+  local proxy); cli; the eval kit's unit tests (`apps/evals/tests`). Evals themselves are
+  `pnpm eval`, outside the gate
+- **Lint**: Biome 2 at the root (single quotes, `asNeeded` semicolons, 100 cols)
+
+## Commands (from the workspace root)
+
+```bash
+pnpm bootstrap · pnpm preflight  # first run in one go (--offline/--online toggle [ai]) / read-only check
+pnpm dev:db:up && pnpm db:migrate  # Postgres on the first free port from :5432 → DATABASE_URL; role → migrations → grants
+pnpm seed [--demo] && pnpm dev  # tenant/users/key (+ populated workspace); wrangler :3001 + vite :3000 (strict ports)
+pnpm dev:stop · pnpm dev:status · pnpm dev:db:status  # kill this repo's dev tree / port holders / every dev database
+pnpm cli login --server http://localhost:3001  # browser → ~/.my-app/config.json, then whoami
+pnpm gate [step…] · pnpm gate --list [--json]  # THE gate: lint → typecheck → test → build (CI's one job, Launch's ship gate)
+prek install · prek run  # fast git hooks, not the gate; kit-owned shell scripts skipped
+pnpm test  # every package; starts the test DB + Neon proxy; suite under postgres, then driver under neon
+TEST_DATABASE_BRANCH=gate-… pnpm test  # a sandbox gate: no Docker, the whole suite on a Neon gate branch (CONCEPTS §4)
+pnpm dev:db:up --neon|--postgres  # D35: local dev on either driver
+pnpm eval [suite] [--model x] [--compare] · pnpm eval:baseline · pnpm eval:view  # real-model evals (D33, docs/EVALS.md)
+pnpm web agent:replay <agent> --tenant <slug> [--candidate f] [--live]  # D38: today's agent code over past runs, read-only
+pnpm lint · pnpm typecheck · pnpm build  # workspace-wide
+pnpm web <script>  # any apps/web script (test:api, db:check…)
+pnpm db:generate · pnpm db:studio · pnpm deploy[:staging] · pnpm provision all  # (or one phase: --help)
+pnpm kit:upgrade [--to X.Y.Z] [--apply]  # port a later kit release into this app (the kit repo also has kit:release)
+```
+
+`wrangler` lives in `apps/web`: `pnpm --filter @my-app/web exec wrangler …`, never at the root. No
+`RESEND_API_KEY` → magic-link URLs are logged; no AI key → chat/agents 503; zero creds locally.
+
+## Architecture
+
+```
+apps/web/          @my-app/web — wrangler*.toml, worker-configuration.d.ts, .dev.vars(.example), .env.test,
+│                  drizzle.config.ts, migrations/, scripts/, tests/
+│  src/worker.ts   export default { fetch, queue, scheduled }; export { NotificationsHub, AgentRunWorkflow }
+│  src/config.ts   loadConfig(env): zod over Cloudflare.Env; routes read c.get('config')
+│  src/permissions/  CASL owner/admin/member/support + isGlobalAdmin   src/db/  client, tenant-scope, schema/
+│  src/api/        index.ts (Hono app, middleware order, ASSETS catch-all) · queue.ts · scheduled.ts ·
+│                  middleware/ · auth/ · routes/ (thin) · services/ (ai/, agents/, prompts.ts) ·
+│                  workflows/ · observability/ · utils/ · queues/ · durable-objects/
+│  src/ui/         React app
+│  src/plugins/    D31 seam: types.ts, api/ (the context family a plugin imports) + the
+│                  server/ui/schema/worker-exports barrels (one line per installed plugin)
+│                  + each plugin's tree — `example-feature/` vendored as the reference one, and
+│                  `analytics/` (cubes, dashboards, fact tables) once you opt in to it
+│                  (per-dir CLAUDE.md: permissions, db/schema, api/*, ui, plugins, plugins/<id>)
+apps/cli/          @my-app/cli — src/cli.ts, commands/*, api.ts (only fetch site), config.ts, login.ts,
+                   plugins/ (CLI_PLUGINS barrel + each plugin's commands)
+apps/evals/        @my-app/evals — vitest-evals suites over apps/web in-process: kit/ (targets, judges),
+                   suites/, datasets/*.jsonl, baselines/; `pnpm eval` only, never the gate (docs/EVALS.md)
+packages/shared/   @my-app/shared — src/*.ts zod contracts, errors, pagination, permissions,
+                   plugins/ (SharedPlugin + the SHARED_PLUGINS barrel + each plugin's contracts) (CLAUDE.md)
+scripts/           bootstrap.sh → bootstrap.mjs (10 steps), rename.mjs, upgrade.mjs (port a kit
+                   release into a copy), release-check.mjs (deploy gates),
+                   kit-update-check.mjs (SessionStart: tells a copy about a newer kit release),
+                   kit-check.mjs (the Launch kit conformance check, shared with the meta-kit), lib/;
+                   kit repo only (`kitOnly`, deleted by the rename): install.sh, release.mjs,
+                   changelog-nudge.mjs + release-site-nudge.mjs (maintainer PreToolUse hooks)
+.rocketflare.json  kit version + commit, the app's names, the replaceable-surface manifest
+launch.kit.json    the Launch kit contract (D36): how Launch scaffolds, gates, ships and upgrades a
+                   copy — kept by every copy; `node scripts/kit-check.mjs` checks it (CONCEPTS §13)
+docs/upgrades/     one porting note per kit release (+ unreleased.md, kit repo only) — CHANGELOG.md is the index
+.claude/skills/    rf-setup · rf-preflight · rf-adapt (+ checklist.md) · rf-provision (+ reference.md) ·
+                   rf-how-do-i (+ example-orders.md) · rf-upgrade (+ porting.md — port later kit releases) ·
+                   rf-plugin (+ reference.md — install/upgrade/remove a plugin, D31) ·
+                   rf-traces (debug a run from its span tree; pick a tracing backend, D32) ·
+                   rf-evals (+ reference.md — author, run, compare, harvest, baseline, improve; D33) ·
+                   rf-agent-replay (replay an agent's past runs with today's code, no model calls; D38) ·
+                   rf-agent-docs (+ check.mjs — audit and fix CLAUDE.md, rules and skills)
+```
+
+**`packages/shared`.** Private, no build: `@my-app/shared/<module>` → `./src/<module>.ts` (incl. `ai/*`,
+`plugins/<id>`). Imports only `zod`, siblings, type-only `@casl/ability`, and `@ag-ui/core` (pinned,
+zod-only, no platform APIs) in `src/ai/agui.ts` alone — the AG-UI wire format is validated by the
+protocol's own schemas on both sides, which a mirror cannot give. A fifth dependency needs the same
+written justification, and `apps/web/tests/config/shared-imports.test.ts` enforces the list.
+
+**`apps/cli`.** `login` opens `GET /auth/cli?redirect_uri=http://127.0.0.1:<port>/callback`; the server
+mints a tenant API key `cli:<host>` → `?key=&tenant_id=&tenant_name=`; stored `0600` in
+`~/.my-app/config.json` (`MY_APP_API_KEY`/`MY_APP_URL` for CI). Also `logout|whoami|status|config`,
+`members|keys|activity list --json`, `agents run <key> --input|--batch` (D39) (`.claude/rules/cli.md`)
+
+## Config model
+
+`[vars]` in both tomls, read via `loadConfig(env)`: `APP_ENV` (`development|staging|production`) ·
+`TENANCY_MODE` (`multi|single` — same schema; single auto-joins the one tenant) ·
+`SIGNUP_MODE` (`open|invite_only|approval`; `BOOTSTRAP_ADMIN_EMAILS` seeds the first admin) ·
+`TENANT_SCOPE_MODE` (`off|enforce`, `docs/RLS.md`) · `DATABASE_DRIVER` (`neon|postgres`, D35; missing =
+`postgres`, `neon` needs the `DATABASE_URL` secret; `.dev.vars` overrides locally, with `NEON_LOCAL_PROXY`) · `AGENT_MAX_OUTPUT_TOKENS` · `AGENT_MAX_TURNS` ·
+`AGENT_MAX_ACTIVE_RUNS_PER_TENANT` (50; 429 above) ·
+`MAX_OWNED_TENANTS_PER_USER` (10) · `INVITATION_EMAILS_PER_USER_PER_DAY` (500) ·
+`INVITATION_EMAILS_PER_TENANT_PER_DAY` (1000) (optional, undeclared = these defaults) · `AGENT_RUN_MAX_TOKENS` / `AGENT_RUN_MAX_COST_USD` /
+`AGENT_TENANT_DAILY_COST_USD` (D39 budgets, unset = no cap; `meta.budget` overrides per agent) ·
+`CHAT_KNOWLEDGE_TOOLS` (`true|false` — chat may call the knowledge tools) ·
+`CHAT_HISTORY_MAX_CHARS` (history a turn replays; older turns are summarised by `chat.compact`) ·
+`FEATURES_ENABLED` (D30 — comma-separated feature keys this deployment ships at all; fail-closed,
+consulted only for a flag marked `environmentGated`; the rollout state itself lives in Postgres) ·
+`OIDC_ISSUER`/`OIDC_CLIENT_ID`/`OIDC_LABEL`/`OIDC_SCOPES`/`AUTH_OIDC_ONLY`/`OIDC_TRUST_EMAIL`
+(optional SSO through any OIDC issuer, declared only when used — `SETUP.md` 2.3b; secret
+`OIDC_CLIENT_SECRET`) · `OIDC_MANAGED_TENANCY` +
+`OIDC_ORGS_CLAIM`/`OIDC_ROLE_MAP`/`OIDC_ADMIT_CLAIM`/`OIDC_GLOBAL_ADMIN_CLAIM`/`OIDC_SESSION_MAX_AGE_DAYS`
+(IdP-managed tenancy: tenants and roles from the id_token, `SETUP.md` 2.3c; secret
+`IDENTITY_WEBHOOK_SECRET` for its identity events).
+
+Rules (auto-loaded by path): `.claude/rules/api.md` · database.md · ui.md · cli.md · testing.md ·
+code-quality.md · cloudflare.md. Runbooks: `docs/DEPLOY.md` · `docs/RLS.md`
+
+## Non-Negotiables
+
+- **Gate**: `pnpm gate` (lint → typecheck → test → build) passes before every commit — the same
+  command a copy's CI job and Launch's ship gate run
+- **Driver seam**: app code is driver-agnostic; `apps/web/src/db/client.ts` is the only place
+  `postgres` and `neon` differ, the guard in `driver-results.test.ts` bans the rest, and
+  `tests/driver/` proves it under both drivers and is never skipped per driver
+  (`apps/web/src/db/CLAUDE.md`)
+- **Tenant isolation**: every domain query filters by `tenantId` from the auth context; every tenant
+  table calls `tenantIsolation()` (RLS inert; `rls-coverage.test.ts` enforces), a plugin's tables
+  included — and a plugin adding a query surface of its own (the analytics plugin's cubes) owns the
+  test that proves it scopes, because the kit cannot
+- **Contracts first**: zod schema in `packages/shared/src/` → route `validate()` → UI/CLI parse the same
+  schema; errors are `{ error, statusCode, code?, details? }`
+- **shared is private** — never publish it; never import `apps/web` from `packages/shared` or `apps/cli`
+- **Routes enqueue, never run**: long work → `JOBS_QUEUE` or `AGENT_RUN_WORKFLOW`; side effects in
+  `waitUntil`; concurrency is a DB claim row, never a `Map`; SSE routes use `streamDatabase(c)`
+- **Two tomls, one shape**: bindings, class names, `compatibility_*`, `[limits]`, crons identical in
+  `apps/web/wrangler{,.staging}.toml`; account-scoped names differ (parity test)
+- **Secrets** never in a toml, git or a response (`hasCredential`); `.dev.vars` comments hold no other
+  credentials; the CLI never prints a full key; `gitleaks` in CI
+- **No `process.env` / Node-only APIs in `apps/web/src/`** (`pg`, `ws`, `node:fs`…); `build:api` catches it
+- **Release = root version**: git tag == root `package.json` `version` (ships web + cli)
+- **Docs in sync**: a behaviour change updates CONCEPTS / SETUP / DEPLOY / rules in the same PR;
+  **in the kit repository** it also adds an entry to `docs/upgrades/unreleased.md` — copies absorb
+  changes by reading those notes, so a change with no note never reaches them (`kit.yml` and the
+  tag gate enforce it). An app writes no porting note
+- **A plugin composes, it never redefines** (D31): it namespaces everything with its id (tables
+  prefixed from it — `example-feature` → `example_*`, and `plugin check` fails a collision — job
+  types `<id>.x`, query-key roots `<id>:…`, `/api/<id>`, CUSTOM events `<id>.` — **never `kit.`**),
+  reaches core only through the six barrels, its own four published entries and the DECLARED import
+  entries (`@/plugins/api`, `@/db/schema/kit`, `@testkit/*`, its own `@/host/<id>/*` — `docs/plugin-api.md`), and ships
+  no migration and no toml edit — the host generates the DDL; its bindings go in BOTH tomls
+- **Released history is never rewritten**: an adopted copy pins a kit commit in `.rocketflare.json`;
+  a force-push to a released tag orphans every copy that came from it
+
+## Agent skills
+
+### Issue tracker
+
+Linear workspace `my-rocketflare-app`, team `MRA`, via the `linear-yo61-my-app` MCP server. See
+`docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five default role labels, workspace-level in Linear. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: root `GLOSSARY.md` + `docs/adr/`. See `docs/agents/domain.md`.

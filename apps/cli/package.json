@@ -1,0 +1,35 @@
+{
+  "name": "@my-app/cli",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "My App command-line interface (login via browser → API key, whoami, tenant-scoped commands)",
+  "type": "module",
+  "bin": {
+    "my-app": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "build": "rm -rf dist && esbuild src/cli.ts --bundle --platform=node --format=esm --target=node22 --outfile=dist/cli.js --sourcemap --external:chalk --external:commander --external:open --external:zod --log-level=warning",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "dependencies": {
+    "@my-app/shared": "workspace:*",
+    "chalk": "^6.0.1",
+    "commander": "^15.0.0",
+    "open": "^11.0.4",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.5"
+  }
+}

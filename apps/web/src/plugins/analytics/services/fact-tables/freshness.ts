@@ -1,0 +1,71 @@
+/**
+ * Fact-table freshness (D19): for each registry entry compare one tenant's newest source row
+ * (`MAX(source.timestampColumn)`) with its newest rebuild (`MAX(fact_refreshed_at)`), both
+ * filtered on `tenant_id` — never across tenants, which would show one organisation another's
+ * activity and let a busy tenant hide a stale one. `lagSeconds`
+ * is how long the newest source row has waited for a refresh — 0 when the fact table is newer than
+ * the source; `stale` when that exceeds 2× the table's refresh interval (one missed cron is fine,
+ * two is not). A table never built while the source has rows is measured against `now`.
+ * Read by `GET /api/analytics/facts/status` (admin+) and so `my-app analytics check-facts`.
+ */
+import type { FactTableStatus } from '@my-app/shared/plugins/analytics/index'
+import { sql } from 'drizzle-orm'
+import type { Database } from '@/plugins/api'
+import { rowsOf } from '../sql-result'
+import { type FactTableDefinition, factTables } from './registry'
+
+function toDate(value: unknown): Date | null {
+  if (value instanceof Date) return value
+  if (typeof value === 'string' || typeof value === 'number') {
+    const d = new Date(value)
+    return Number.isNaN(d.getTime()) ? null : d
+  }
+  return null
+}
+
+async function maxOf(db: Database, query: ReturnType<typeof sql>): Promise<Date | null> {
+  const [row] = rowsOf<{ max_ts: unknown }>(await db.execute(query))
+  return toDate(row?.max_ts)
+}
+
+export function computeFreshness(
+  def: Pick<FactTableDefinition, 'name' | 'refreshIntervalMinutes'>,
+  refreshedAt: Date | null,
+  sourceMaxAt: Date | null,
+  now: Date = new Date()
+): FactTableStatus {
+  let lagSeconds = 0
+  if (sourceMaxAt) {
+    // Never built: every source row is waiting, measured from the newest one to now.
+    // Built: the newest source row has waited since the last build (0 if the build is newer).
+    const reference = refreshedAt
+      ? sourceMaxAt.getTime() - refreshedAt.getTime()
+      : now.getTime() - sourceMaxAt.getTime()
+    lagSeconds = Math.max(0, Math.floor(reference / 1000))
+  }
+  return {
+    table: def.name,
+    refreshedAt,
+    lagSeconds,
+    stale: lagSeconds > def.refreshIntervalMinutes * 60 * 2,
+  }
+}
+
+export async function checkFactTableFreshness(
+  db: Database,
+  tenantId: string,
+  now: Date = new Date()
+): Promise<FactTableStatus[]> {
+  const out: FactTableStatus[] = []
+  const ofTenant = sql`where tenant_id = ${tenantId}`
+  for (const def of factTables()) {
+    const { table, source } = def
+    const newest = source.timestampColumn
+    const [refreshedAt, sourceMaxAt] = await Promise.all([
+      maxOf(db, sql`select max(fact_refreshed_at) as max_ts from ${table} ${ofTenant}`),
+      maxOf(db, sql`select max(${newest}) as max_ts from ${source.table} ${ofTenant}`),
+    ])
+    out.push(computeFreshness(def, refreshedAt, sourceMaxAt, now))
+  }
+  return out
+}
