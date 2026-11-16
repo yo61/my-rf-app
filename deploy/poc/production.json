@@ -1,9 +1,9 @@
 {
   "cloudflare": {
-    "workerName": "my-app",
+    "workerName": "my-app-production",
     "vars": {
       "APP_ENV": "production",
-      "APP_URL": "https://my-app.mra-poc-client.workers.dev",
+      "APP_URL": "https://my-app-production.mra-poc-client.workers.dev",
       "TENANCY_MODE": "single",
       "SIGNUP_MODE": "invite_only",
       "DATABASE_DRIVER": "neon"
@@ -11,19 +11,19 @@
     "bindings": {
       "FILES": {
         "type": "r2",
-        "bucket": "my-app-files"
+        "bucket": "my-app-files-production"
       },
       "RATE_LIMIT_KV": {
         "type": "kv",
-        "title": "my-app-rate-limit"
+        "title": "my-app-rate-limit-production"
       },
       "JOBS_QUEUE": {
         "type": "queue",
-        "queue": "my-app-jobs"
+        "queue": "my-app-jobs-production"
       },
       "AGENT_RUN_WORKFLOW": {
         "type": "workflow",
-        "name": "my-app-agent-run"
+        "name": "my-app-agent-run-production"
       }
     },
     "secrets": ["DATABASE_URL"]
