@@ -72,15 +72,11 @@ jobs:
         with:
           node-version-file: .nvmrc
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter @my-app/web build:ui
-      - run: pnpm --filter @my-app/web exec wrangler deploy --dry-run --outdir dist/deploy
+      - run: deploy/poc/build-artefact.sh "$RUNNER_TEMP/artefact"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: artefact
-          path: |
-            apps/web/dist/deploy
-            apps/web/dist/ui
-            apps/web/migrations
+          path: ${{ runner.temp }}/artefact
           if-no-files-found: error
           retention-days: 1
 
@@ -115,6 +111,7 @@ jobs:
             dist/deploy:application/vnd.yo61.operated-app.worker.v1.tar+gzip \
             dist/ui:application/vnd.yo61.operated-app.assets.v1.tar+gzip \
             migrations:application/vnd.yo61.operated-app.migrations.v1.tar+gzip \
+            worker-config.json:application/vnd.yo61.operated-app.worker-config.v1+json \
             --format json | jq --raw-output .digest)
           [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::oras push gave no digest"; exit 1; }
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
