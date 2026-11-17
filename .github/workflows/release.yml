@@ -20,9 +20,23 @@ jobs:
     name: Check tag
     runs-on: ubuntu-latest
     timeout-minutes: 2
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.tag.outputs.version }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Tagged commit is on main
+        shell: bash
+        run: |
+          set -o errexit -o nounset -o pipefail
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME tags $GITHUB_SHA, which is not on main"
+            exit 1
+          fi
       - name: Tag is v<semver>
         id: tag
         shell: bash
