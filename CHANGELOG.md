@@ -3,6 +3,12 @@
 Releases of this app. The kit releases it has absorbed are recorded in `.rocketflare.json`
 (`kit`, `history`) and described in `docs/upgrades/`.
 
+## 0.5.0
+
+- The release banner is violet: release "Violet".
+- Removes 0.4.0's `v2` migration for `ReleaseCounter`. It was never applied: the reconciler
+  refused 0.4.0.
+
 ## 0.4.0
 
 - The release banner is crimson: release "Crimson".

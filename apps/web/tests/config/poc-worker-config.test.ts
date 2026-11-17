@@ -63,10 +63,7 @@ describe('workerConfig, from the real wrangler.toml', () => {
     expect(config.durable_objects).toEqual({
       bindings: [{ name: 'NOTIFICATIONS_HUB', class_name: 'NotificationsHub' }],
     })
-    expect(config.migrations).toEqual([
-      { tag: 'v1', new_sqlite_classes: ['NotificationsHub'] },
-      { tag: 'v2', new_sqlite_classes: ['ReleaseCounter'] },
-    ])
+    expect(config.migrations).toEqual([{ tag: 'v1', new_sqlite_classes: ['NotificationsHub'] }])
     expect(config.ai).toEqual({ binding: 'AI' })
   })
 })
