@@ -26,6 +26,7 @@ import { PendingInvitationsBanner } from '@/ui/components/PendingInvitationsBann
 import { PluginHeaderSlot } from '@/ui/components/PluginHeaderSlot'
 import { ProtectedRoute } from '@/ui/components/ProtectedRoute'
 import { AbilityProvider } from '@/ui/components/permissions/AbilityContext'
+import { ReleaseBanner } from '@/ui/components/ReleaseBanner'
 import { RequireGuard } from '@/ui/components/RequireGuard'
 import { RoleBadge } from '@/ui/components/RoleBadge'
 import ScrollToTop from '@/ui/components/ScrollToTop'
@@ -376,6 +377,7 @@ export default function App() {
                 <ScrollToTop />
                 <AppRoutes />
                 <ToastContainer />
+                <ReleaseBanner />
               </BrowserRouter>
             </WebSocketProvider>
           </AbilityProvider>
