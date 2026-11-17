@@ -150,7 +150,7 @@ class_name = "NotificationsHub"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["NotificationsHub"]
+new_sqlite_classes = ["NotificationsHub"]
 
 # File storage (D23): R2 behind `services/storage.ts`. Create: wrangler r2 bucket create my-app-files
 [[r2_buckets]]
