@@ -180,8 +180,7 @@ code-quality.md · cloudflare.md. Runbooks: `docs/DEPLOY.md` · `docs/RLS.md`
 - **Secrets** never in a toml, git or a response (`hasCredential`); `.dev.vars` comments hold no other
   credentials; the CLI never prints a full key; `gitleaks` in CI
 - **No `process.env` / Node-only APIs in `apps/web/src/`** (`pg`, `ws`, `node:fs`…); `build:api` catches it
-- **Release = root version**: git tag == root `package.json` `version` (ships web + cli); bump
-  `RELEASE` in `apps/web/src/ui/release.ts` with it (the release banner; `release-banner.test.ts`)
+- **Release = root version**: git tag == root `package.json` `version` (ships web + cli)
 - **Docs in sync**: a behaviour change updates CONCEPTS / SETUP / DEPLOY / rules in the same PR;
   **in the kit repository** it also adds an entry to `docs/upgrades/unreleased.md` — copies absorb
   changes by reading those notes, so a change with no note never reaches them (`kit.yml` and the
