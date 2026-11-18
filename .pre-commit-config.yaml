@@ -21,7 +21,7 @@ repos:
       - id: biome
         name: biome check
         entry: pnpm exec biome check
-        args: [--diagnostic-level=error, --no-errors-on-unmatched, --files-ignore-unknown=true]
+        args: [--error-on-warnings, --no-errors-on-unmatched, --files-ignore-unknown=true]
         language: system
         types_or: [javascript, jsx, ts, tsx, json, css]
 
