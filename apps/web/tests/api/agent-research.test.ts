@@ -319,7 +319,9 @@ describe('research-topic agent', () => {
     // the moment it came back, the failed call cost nothing, and the resumed attempt's turn is the
     // second row — the carried-forward checkpoint usage is never written again.
     const usage = await db.query.aiUsage.findMany({ where: eq(aiUsage.tenantId, tenant.id) })
-    expect(usage.map(u => [u.inputTokens, u.outputTokens]).sort((a, b) => a[0]! - b[0]!)).toEqual([
+    expect(
+      usage.map(u => [u.inputTokens, u.outputTokens]).sort((a, b) => (a[0] ?? 0) - (b[0] ?? 0))
+    ).toEqual([
       [40, 10],
       [60, 20],
     ])
