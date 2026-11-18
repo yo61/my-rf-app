@@ -3,6 +3,10 @@
 Releases of this app. The kit releases it has absorbed are recorded in `.rocketflare.json`
 (`kit`, `history`) and described in `docs/upgrades/`.
 
+## 0.6.0
+
+- The release banner is lime: release "Lime".
+
 ## 0.5.0
 
 - The release banner is violet: release "Violet".
