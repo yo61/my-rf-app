@@ -77,7 +77,7 @@ mode = "smart"                          # run near the database (Neon region), n
 [observability.logs]
 enabled = true
 head_sampling_rate = 1
-invocation_logs = false
+invocation_logs = true
 
 # React SPA served from Workers Static Assets, deployed atomically with the Worker. API
 # routes are matched by Hono first; the catch-all serves assets with SPA fallback.

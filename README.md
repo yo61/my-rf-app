@@ -101,6 +101,7 @@ you removed. [`CHANGELOG.md`](CHANGELOG.md) is what you would be catching up on.
 - **Sessions as rows** — `__Host-session` cookie, 7-day sliding TTL, one LATERAL query per request.
 - **Tenant API keys** — hashed, scoped, expirable, revocable from Settings; the Bearer path shares the auth middleware and abilities with the UI.
 - **Hardening built in** — CSRF by origin allow-list, KV sliding-window rate limits on login routes, security headers, body limits, dev-login that 404s in production, `gitleaks` in CI.
+- **A security audit you can re-run** — `/rf-security` sends independent agents after the threat model in `docs/THREAT-MODEL.md`, checks every candidate on a second model, confirms only what a test proves, runs proofs in a locked-down Docker sandbox, and keeps findings outside the repository (`docs/SECURITY-AUDIT.md`).
 
 ### Background work and realtime
 - **Jobs queue** — one `JOBS_QUEUE` with typed envelopes (`email.send`, `activity.record`, `document.index`, …); invalid messages are acked (never loop), handler errors retry with capped backoff; a missing binding throws rather than running work inline.
