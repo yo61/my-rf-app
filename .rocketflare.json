@@ -18,7 +18,7 @@
     {
       "id": "analytics",
       "repo": "https://github.com/rocketflare-dev/rocketflare-plugins.git",
-      "ref": "3.11.0",
+      "ref": "3.12.0",
       "subdir": "plugins/analytics"
     }
   ],
@@ -342,8 +342,8 @@
       "source": {
         "repo": "https://github.com/rocketflare-dev/rocketflare-plugins.git",
         "subdir": "plugins/analytics",
-        "version": "3.11.0",
-        "commit": "9a7f3428eb06c4cd2b13eb915b9b4ce1cb2ea6b5"
+        "version": "3.12.0",
+        "commit": "2b5b3cb90c3923a5ffc845d6aaf5c7d6c56fe01a"
       },
       "installedAt": "2026-11-02",
       "minKit": "0.29.0",
@@ -374,6 +374,11 @@
           "from": "2ecb2a3886bad5c46869d4dffb31238ad5015085",
           "to": "9a7f3428eb06c4cd2b13eb915b9b4ce1cb2ea6b5",
           "at": "2026-11-10"
+        },
+        {
+          "from": "9a7f3428eb06c4cd2b13eb915b9b4ce1cb2ea6b5",
+          "to": "2b5b3cb90c3923a5ffc845d6aaf5c7d6c56fe01a",
+          "at": "2026-11-19"
         }
       ]
     },
