@@ -20,6 +20,7 @@ Keep the classes out of `api/index.ts` — it lets tests drive `app.request(req,
 - a model call, chat, a streaming route, ingest, retrieval → `src/api/services/ai/CLAUDE.md`
 - agent runs, tools, interrupts, decisions → `src/api/services/agents/CLAUDE.md`; the Workflow
   class → `src/api/workflows/CLAUDE.md`; a job type or consumer → `src/api/queues/CLAUDE.md`
+- knowledge facts, entity types, `/api/knowledge` → `src/api/services/knowledge/CLAUDE.md`
 - anything a plugin contributes, or the analytics plugin → `apps/web/src/plugins/CLAUDE.md`
 
 ## Middleware order (do not reorder casually — each step needs what the earlier ones set)
@@ -32,7 +33,8 @@ Keep the classes out of `api/index.ts` — it lets tests drive `app.request(req,
 4. `securityHeaders` — **returns a 101 untouched**; the `embeddable` opt-in is for a route that has
    PROVED the content type, never a path allowlist
 5. `apiBodyLimit` (1 MB) on `/api/*`, `jsonBodyLimit` on `/auth/*` and each plugin `apiPrefixes`
-   entry outside `/api` — skipped for `UPLOAD_PATHS`, which cap per route; a plugin public mount's
+   entry outside `/api` — beneath `UPLOAD_PATHS` / `uploadPaths` only a non-JSON body is let past
+   1 MB, up to 10 MB + 64 KB, and each upload route caps itself tighter; a plugin public mount's
    `bodyLimitBytes` replaces it beneath its prefix
 6. `cors` (before CSRF so preflights are answered; **bypassed for `Upgrade: websocket`**) → `csrf`
    (cookie-only, no DB)

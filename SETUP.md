@@ -354,7 +354,8 @@ magic link — it arrives by email.
 3. `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`
 
 Absent: the button is hidden (`GET /auth/methods`). Verify: "Continue with Google" round-trips.
-An account whose `email_verified` is false is refused — for every provider.
+An account whose `email_verified` is false is refused (`email_unverified`) — for every provider —
+unless that identity is already linked to an account, which then signs in as before.
 
 ### 2.3 Microsoft OAuth (Entra ID)
 1. Azure Portal → App registrations → New; account type "any organizational directory and
@@ -362,9 +363,16 @@ An account whose `email_verified` is false is refused — for every provider.
 2. Redirect URI (Web): `{APP_URL}/auth/microsoft/callback` for each origin as in 2.2
 3. Certificates & secrets → new client secret → `MICROSOFT_CLIENT_ID` / `MICROSOFT_CLIENT_SECRET`
 
-Account matching uses the user principal name, whose domain Entra requires the directory to have
-verified, never the separately editable `mail` attribute. Someone whose UPN differs from the
-address they were invited at signs in as their UPN.
+Account matching uses the user principal name, never the separately editable `mail` attribute,
+and only when the signing-in directory lists the UPN's domain among its verified domains (Graph
+`/organization`, read with the `User.Read` scope the app already asks for). Someone whose UPN
+differs from the address they were invited at signs in as their UPN.
+
+**Personal Microsoft accounts** (outlook.com, hotmail.com, live.com) have no directory to prove
+their address, so they are never matched to an account or admitted by it — the callback answers
+`email_unverified`. Such a person signs in another way first (magic link, Google), then links
+Microsoft from account settings; from then on "Continue with Microsoft" signs them in. The same
+holds for a work account whose UPN is on a domain its directory has not verified.
 
 Absent: button hidden. Verify: round trip. Redirect URIs are always derived from `APP_URL`; there
 is no `*_REDIRECT_URI` variable to set.
@@ -402,7 +410,8 @@ without issuer and client id refuses to boot (config error). Verify: `/auth/meth
 `"oidc": { "label": … }`; "Continue with <label>" round-trips; `Sign out` returns to
 `/login?signedOut=1` (through the issuer's logout page when it advertises `end_session_endpoint`).
 An account whose `email_verified` is `false` — or missing, unless `OIDC_TRUST_EMAIL=true` — is
-refused (`?error=email_unverified`); an existing kit user is linked by verified email.
+refused (`?error=email_unverified`) unless that identity is already linked; an existing kit user
+is linked by verified email.
 
 ### 2.3c IdP-managed tenancy (`OIDC_MANAGED_TENANCY=true`)
 For an identity service that decides which organisations a person may use THIS app in, and with
@@ -523,6 +532,44 @@ documents is free) in the `document.convert` queue job. Verify: upload a small P
 watch the row go `Indexing → Indexed` within the 5 s poll (the wrangler terminal logs
 `document.convert: indexed`), search a phrase from it, and click the download icon to get the
 original back from R2. Without `[ai]` a binary upload answers 503 `conversion_not_configured`.
+
+**Reranking** (knowledge search reorders its top 20 fused candidates by relevance): with the `AI`
+binding it is on by default — Workers AI `@cf/baai/bge-reranker-base`, about $0.003 per million
+input tokens, one extra call per search. For a stronger reranker add one per tenant in Settings →
+AI → *Add reranker provider*: provider *OpenAI-compatible endpoint* with a preset (Fireworks
+`fireworks/qwen3-reranker-8b`, Cohere `rerank-v3.5`, Voyage `rerank-2.5-lite`) and the vendor's key;
+**Test connection** reranks two short documents. Without the binding or a row search keeps its
+fused order. `RERANK_MIN_SCORE=` (0–1, blank = off) drops reranked hits scored below it; its scale is
+per model, so set it from an eval run (`docs/EVALS.md`). `RERANK_CANDIDATES=` (5–100, blank = 20)
+is how many chunks go to the reranker: its latency grows with it. Verify: `curl -b <cookie>
+localhost:3001/api/ai/config/readiness` → `"rerank":{"ready":true,…}`, and a `POST
+/api/ai/documents/search` hit carries a `rerankScore`.
+
+**Knowledge spend**: every embedding, rerank and fact-extraction call is an `ai_usage` row
+(`knowledge.embeddings`, `knowledge.rerank`, `knowledge.extraction`), shown on Settings → Usage.
+`KNOWLEDGE_TENANT_DAILY_COST_USD=` (blank = no cap) caps what one tenant's knowledge work may spend
+per UTC day; only fact extraction pauses at it (it resumes the next UTC day), indexing and search
+never do. Deployed, put it in BOTH tomls' `[vars]`.
+
+**Knowledge facts** (D43, `docs/CONCEPTS.md` §9 — typed facts read from documents, with conflicts
+and doubtful facts sent to a person for review): off until two things are true.
+
+1. **An entity type is registered** — the kit registers none. Add one to `APP_ENTITY_TYPES` in
+   `apps/web/src/api/services/knowledge/entity-types.ts` (the file's header shows a type over one
+   of your tables and one with no table), or from a plugin through
+   `ServerPlugin.knowledgeEntityTypes`. `pnpm web test:config` runs `knowledge-entity-types.test.ts`,
+   which refuses a bad registration.
+2. **The `knowledge-facts` flag is on for the tenant** — default off. As a global admin, open
+   **Admin → Feature flags → Knowledge facts** and set it On (every tenant), to Rollout, or force it
+   on for one organisation (§2.8).
+
+Extraction then runs on every new or changed document: one call per heading-bounded section to the
+tenant's chat model, or to the model assigned to the `knowledge-extract` prompt in Settings → agent
+models; about $0.0009 a document on Haiku. Set `KNOWLEDGE_TENANT_DAILY_COST_USD` before turning it on
+widely. Documents indexed before the flag was on are not extracted until their text changes. Verify:
+`pnpm cli features list --json` shows `knowledge-facts` on; upload a document naming one of your
+entities, then open Knowledge → **To review** or ask chat about the entity — the answer cites the
+facts with their source.
 
 **Decisions** (`ctx.decide`, D37 — typed questions agents ask, e.g. the `triage-research` example's
 relevance screen): with nothing configured the chat model answers them with its own probabilities,
@@ -651,10 +698,10 @@ and then deleted.
 
 ### 2.8 Feature flags `[ready]` (D30)
 
-Nothing to configure — flags work out of the box, and the kit itself ships none: the one inert demo
-flag (`example-feature`, a nav item, a page and a notes API) belongs to the reference PLUGIN of the
-same name (D31, `apps/web/src/plugins/example-feature/`), which is installed by default and safe to
-delete. As a global admin, open **Admin → Feature flags**: set it to On and the nav item appears; to
+Nothing to configure — flags work out of the box. The kit core ships one, `knowledge-facts`
+(default off; §2.5 "Knowledge facts"). The inert demo flag (`example-feature`, a nav item, a page
+and a notes API) belongs to the reference PLUGIN of the same name (D31,
+`apps/web/src/plugins/example-feature/`), which is installed by default and safe to delete. As a global admin, open **Admin → Feature flags**: set it to On and the nav item appears; to
 Rollout and the percentage decides deterministically; force it on or off for one organisation and
 that beats the percentage either way.
 

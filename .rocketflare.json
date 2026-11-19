@@ -5,8 +5,8 @@
     "id": "rocketflare",
     "name": "rocketflare",
     "repo": "https://github.com/rocketflare-dev/rocketflare.git",
-    "version": "0.33.0",
-    "commit": "f3cfeb22f7066b217e6451aad23cbb0255fc2d0c"
+    "version": "0.39.0",
+    "commit": "0e1eb482384fd662f0f0e4a9e155025c0ee31822"
   },
   "app": {
     "slug": "my-app",
@@ -72,6 +72,41 @@
       "from": "9b0afcbd2209a0ed5ac644b4fad6514ac109d8c3",
       "to": "f3cfeb22f7066b217e6451aad23cbb0255fc2d0c",
       "at": "2026-11-10"
+    },
+    {
+      "from": "f3cfeb22f7066b217e6451aad23cbb0255fc2d0c",
+      "to": "a4995dccc962b3f4463195038715058759fb6b8a",
+      "at": "2026-11-19"
+    },
+    {
+      "from": "a4995dccc962b3f4463195038715058759fb6b8a",
+      "to": "f9545f29fb84ecf27013d2ee32f17ccc64b9c12f",
+      "at": "2026-11-19"
+    },
+    {
+      "from": "f9545f29fb84ecf27013d2ee32f17ccc64b9c12f",
+      "to": "200eb0dac01fb8eaa5e868cc6ead6f634da34529",
+      "at": "2026-11-19"
+    },
+    {
+      "from": "200eb0dac01fb8eaa5e868cc6ead6f634da34529",
+      "to": "e378d21e2fcbd9ec114d8c33d776a315f9d867c4",
+      "at": "2026-11-19"
+    },
+    {
+      "from": "e378d21e2fcbd9ec114d8c33d776a315f9d867c4",
+      "to": "054e6ee51b1f65d3153cc811f2be5b68dd9fd028",
+      "at": "2026-11-19"
+    },
+    {
+      "from": "054e6ee51b1f65d3153cc811f2be5b68dd9fd028",
+      "to": "418b9f6446b907cedae43f82b66a50913cc029d2",
+      "at": "2026-11-19"
+    },
+    {
+      "from": "418b9f6446b907cedae43f82b66a50913cc029d2",
+      "to": "0e1eb482384fd662f0f0e4a9e155025c0ee31822",
+      "at": "2026-11-19"
     }
   ],
   "surfaces": [
@@ -341,6 +376,14 @@
           "at": "2026-11-10"
         }
       ]
+    },
+    {
+      "id": "threat-model",
+      "kind": "example",
+      "label": "The threat model the security audit reads",
+      "anchor": "docs/THREAT-MODEL.md",
+      "paths": ["docs/THREAT-MODEL.md"],
+      "registries": []
     }
   ],
   "neverPort": [
@@ -387,7 +430,8 @@
     "apps/*/package.json",
     "packages/*/package.json",
     ".github/workflows/**",
-    "apps/web/src/ui/components/shared/LogoMark.tsx"
+    "apps/web/src/ui/components/shared/LogoMark.tsx",
+    "docs/THREAT-MODEL.md"
   ],
   "core": [
     "apps/web/src/**",

@@ -49,6 +49,13 @@ patcher's tests; `tests/kit-only/fixtures/kit-fixture.mjs` makes a whole kit, fr
 like Launch's `write_config`, for the kit-only conformance tests), and put the claim about THIS
 checkout in `kit-only`.
 
+**The security audit's runner** (`.claude/skills/rf-security/tools/`, `docs/SECURITY-AUDIT.md`) is
+tested in `config` by `tests/config/rf-security/`: child-process runs of `audit.mjs` and
+`guard-hook.mjs` over a synthetic run in the OS temp directory (`fixture.ts` plays the agents'
+part; `RF_SECURITY_RUNS` points the runs root there), never a real run's files. A confirmed audit
+finding, once fixed, lands as a permanent regression test in `tests/api/security/`, named for the
+behaviour rather than the attack.
+
 ## Tests run under Node, against the real Hono app
 
 - `app.request(req, env, ctx)` with `env = createTestEnv(overrides)` from `apps/web/tests/mocks/bindings.ts`:
@@ -110,6 +117,12 @@ checkout in `kit-only`.
   they drive the kit's tooling end to end through child processes, which slow with CPU load, not
   with a database link
 - Per-file `apps/web/tests/api-setup.ts` closes clients after each file (connection budget: forks × pools)
+  and installs the **network guard** (`tests/helpers/network-guard.ts`): an api test never reaches
+  the internet — a request to anything but loopback / `localhost` / `*.localtest.me` rejects AT ONCE
+  with `OutboundNetworkError` naming the URL. A test that needs a provider's answer runs a local
+  `node:http` server on 127.0.0.1 (`security/ai-config-stored-credential.test.ts`) or injects
+  `fetch`. A row on a vendor's DEFAULT endpoint is a real call: give it a local `baseUrl`. A test
+  that takes seconds is waiting on something — a timeout, a retry backoff, a lock — not slow
 - **Both drivers (D35), one seam.** `.env.test` sets `DATABASE_DRIVER=postgres`, so the narrow
   scripts and the suite run postgres.js; `pnpm test` then runs the `driver` project under `neon`
   through the proxy on :4433 (compose profile `neon`). App code does not branch on the driver, so

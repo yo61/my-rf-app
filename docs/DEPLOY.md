@@ -8,7 +8,8 @@ reference it points at.
 `wrangler.staging.toml`, `worker-configuration.d.ts`, `scripts/cf-provision.sh`, the parity test.
 `wrangler` is a devDependency of that package, so every wrangler command runs **in `apps/web`** —
 either `pnpm --filter @my-app/web exec wrangler …` from the root (shorthand `pnpm web exec wrangler …`)
-or the root scripts that delegate there (`pnpm deploy`, `pnpm deploy:staging`, `pnpm provision`,
+or the root scripts that delegate there (`pnpm run deploy`, `pnpm run deploy:staging` — `run`, because a bare `pnpm deploy` is pnpm's own
+command and deploys nothing — `pnpm provision`,
 `pnpm types`). `pnpm exec wrangler` at the workspace root does not resolve. Only `apps/web` is
 deployed. **The CLI (`apps/cli`) is not deployed**: CI builds it (`pnpm build` → `apps/cli/dist`) as
 a compile check, and it is distributed through the repo (`pnpm cli …`, or `pnpm --filter @my-app/cli
@@ -27,7 +28,7 @@ package is private by default (`"private": true`, like `packages/shared`, which 
               │ .toml            │  │                  │   + NotificationsHub DO
               └───────┬──────────┘  └────────┬─────────┘   + AgentRunWorkflow
    bindings:  RATE_LIMIT_KV  [JOBS_QUEUE  FILES  AGENT_RUN_WORKFLOW  AI]  ASSETS  (+ HYPERDRIVE under postgres)
-   crons:     0 4 * * * (prune)  + every installed plugin's       routes: /api /auth /ws + plugins'
+   crons:     0 4 * * * (prune) · */10 (sweep runs) + plugins'    routes: /api /auth /ws + plugins'
                       │                      │
    neon:      DATABASE_URL secret        DATABASE_URL secret              (pooled Neon host, HTTPS + WS)
    postgres:  Hyperdrive <app>-staging   Hyperdrive <app>-production      (direct host, any Postgres)
@@ -125,21 +126,23 @@ in both files (one local database).
 | Hyperdrive (`postgres` only) | `HYPERDRIVE` | `<app>-production` / `<app>-staging` | `pnpm --filter @my-app/web exec wrangler hyperdrive create <name> --connection-string="<direct neon url>"` → `id` |
 | KV | `RATE_LIMIT_KV` | `<APP>_RATE_LIMIT` / `<APP>_RATE_LIMIT_STAGING` | `pnpm --filter @my-app/web exec wrangler kv namespace create <name>` → `id` |
 | Queue (Phase 2) | `JOBS_QUEUE` | `<app>-jobs` / `<app>-jobs-staging` | `pnpm --filter @my-app/web exec wrangler queues create <name>` (name-referenced) |
+| Jobs dead-letter queue | — (no binding; `[[queues.consumers]] dead_letter_queue`) | `<app>-jobs-dlq` / `<app>-jobs-dlq-staging` | `pnpm --filter @my-app/web exec wrangler queues create <name>` — must exist before the deploy that names it. Receives a message whose handler threw on every one of `max_retries`; **no consumer is bound** (its name shares the `<app>-jobs` prefix `queue.ts` dispatches on, so one would reprocess it). Inspect it in the dashboard (Queues → the DLQ → Messages) or `… wrangler queues info <name>` |
 | R2 (Phase 2) | `FILES` | `<app>-files` / `<app>-files-staging` | `pnpm --filter @my-app/web exec wrangler r2 bucket create <name>` |
 | Durable Object (Phase 2) | `NOTIFICATIONS_HUB` | class `NotificationsHub` | declared in toml + `[[migrations]] tag = "v1", new_sqlite_classes` (SQLite-backed: new accounts cannot create KV-backed classes) — no create step |
-| Workflow (Phase 3, built) | `AGENT_RUN_WORKFLOW` | `<app>-agent-run` / `<app>-agent-run-staging` | `[[workflows]] name / binding / class_name = "AgentRunWorkflow"` — `wrangler deploy` registers it, no create step; **account-scoped name** |
+| Workflow (Phase 3, built) | `AGENT_RUN_WORKFLOW` | `<app>-agent-run` / `<app>-agent-run-staging` | `[[workflows]] name / binding / class_name = "AgentRunWorkflow"` — `wrangler deploy` registers it, no create step; **account-scoped name**. Optional `concurrency = { limit = N }` (Wrangler ≥ 4.127) caps RUNNING instances across every tenant — above it instances queue, and `waiting` (parked) ones do not count; it is a cost backstop, not the per-tenant `AGENT_MAX_ACTIVE_RUNS_PER_TENANT`. Not set by the kit; if you set it, set it in BOTH tomls — a deploy without it removes the limit |
 | Workers AI (Phase 3, built) | `AI` | — | `[ai] binding = "AI"` — no resource; the zero-key floor for chat (`@cf/zai-org/glm-4.7-flash`) and embeddings (`@cf/baai/bge-m3`); **billed per call to this account** (10k free neurons/day), `wrangler dev` proxies to the logged-in account; remove from BOTH tomls for zero-spend |
 | Analytics (a PLUGIN, D31) | — | — | **no resource and no binding**: its cubes read through the request's database handle (either driver), its fact tables rebuild on the `15 * * * *` cron it declares, and `/cubejs-api` + `/mcp` are routes of this Worker. Installing it means adding that cron and those two prefixes to BOTH tomls — `pnpm provision cloudflare <env>` reads them off the installed surface and writes them (decision 12) |
 | Analytics Engine (optional) | `ANALYTICS_ENGINE` | `<app>_analytics[_staging]` | declared in toml — deliberately NOT wired by the kit (only a comment in both tomls) |
 | Static Assets | `ASSETS` | — | `[assets] directory = "./dist/ui"` uploaded atomically with each deploy; `run_worker_first` keeps `/api`, `/auth`, `/ws` — and every prefix an installed plugin declares — off the asset router |
 | RLS app role (optional, docs/RLS.md, not wired yet) | `postgres`: `HYPERDRIVE_APP`; `neon`: an `APP_DATABASE_URL` Worker secret | `<app>-<env>-app` | `postgres`: `… hyperdrive create … --caching-disabled`; `neon`: `wrangler secret put APP_DATABASE_URL` |
 | Plugin resources (D31) | whatever the plugin's `plugin.json` declares (`APPROVALS_CACHE`…) | `<app>-<id>-<name>[-staging]`, and `<APP>_<ID>_<NAME>[_STAGING]` for KV | `pnpm provision cloudflare <env>` — it reads each installed plugin's `bindings[]`, creates the `kv`/`queue`/`r2` ones through `cf-provision.sh` and patches every block into BOTH tomls |
+| Version metadata (D44) | `CF_VERSION_METADATA` | — (no resource) | `[version_metadata] binding = "CF_VERSION_METADATA"` in BOTH tomls: the deployment id each agent run records as `worker_version_id`, so `my-app agents inspect` says which deploy a run last ran on. No create step |
 | Plugin Workflow / Durable Object (D31) | whatever the plugin declares (`ORDERS_SYNC`, `ORDERS_HUB`…) | workflow `<app>-<id>-<name>[-staging]`; a DO binding has no account-scoped name | **no create step** — `pnpm provision cloudflare <env>` writes `[[workflows]]` / `[[durable_objects.bindings]]` (+ a `plugin-<id>-v1` `[[migrations]]` tag) into both tomls and `wrangler deploy` registers them. The `class_name` resolves through the sixth barrel, `apps/web/src/plugins/worker-exports.ts` |
 
 `pnpm web provision:cloudflare <staging|production> [app] [--apply] [--force]` (the `apps/web`
 script → `scripts/cf-provision.sh`, which `cd`s to `apps/web` itself so it also works as
 `bash apps/web/scripts/cf-provision.sh …`) creates a RESOURCE LIST idempotently — the kit's own
-ones, KV, Queue and R2 (plus Hyperdrive when `DATABASE_DRIVER` — from the environment, else the
+ones, KV, the jobs Queue and its dead-letter queue, and R2 (plus Hyperdrive when `DATABASE_DRIVER` — from the environment, else the
 toml — is `postgres`), are the default list, each found by name and reused when it exists, and `PLUGIN_RESOURCES` (a JSON array of `{ type, name, binding }`, set by
 `pnpm provision cloudflare <env>` from the installed plugins' manifests) appends to it — and either
 prints the Hyperdrive/KV ids
@@ -210,17 +213,33 @@ What each host needs on Cloudflare:
   here. A host on a zone held in another Cloudflare account cannot be routed to this Worker. The
   check finds zones through the API token, so it only proves the account if the token is scoped to
   that one account.
-- **No conflicting DNS record.** Every entry is a custom domain (`custom_domain = true`), so
-  `wrangler deploy` creates the DNS record and certificate for the host itself. Delete an existing
-  CNAME at that host first; a deploy over one fails.
-- **An exact hostname.** Custom domains take no wildcard, so list each host. An apex host is
-  allowed; redirecting `example.com` to `www` is a Cloudflare redirect rule, not a route here.
+- **The app alone is a custom domain; with site hosts, every host is a zone route.** An app with
+  no site hosts gets `{ pattern = "app.example.com", custom_domain = true }`, and `wrangler deploy`
+  creates its DNS record and certificate (delete an existing CNAME there first; a deploy over one
+  fails). Once a toml has site hosts, `provision urls` writes the app and every site host as
+  `{ pattern = "<host>/*", zone_name = "<zone>" }` instead, converts the custom-domain entries it
+  wrote earlier, and creates a proxied `AAAA 100::` record at each host that has no A, AAAA or
+  CNAME yet (an existing proxied one is kept; a DNS-only one is an error, since a route never sees
+  that traffic).
+  **Why not several custom domains:** one Worker on two custom domains of one zone shares one
+  certificate and address, so a browser reuses the connection it opened for one host to fetch the
+  other — and Cloudflare answers that request with a bare 403 before the Worker runs. No WAF event,
+  no Worker log, and an incognito window (a fresh connection) works, which makes it look like a
+  cookie or extension problem. `curl --connect-to` reproduces it. Zone routes over proxied records
+  have no such coupling.
+- **An exact hostname.** List each host. An apex host is allowed; redirecting `example.com` to
+  `www` is a Cloudflare redirect rule, not a route here.
 
 The API token needs Zone → DNS — Edit on every one of those zones (§ Cloudflare API token scopes),
 including a zone only a site host uses.
 
 A site host needs the app on a custom host of its own: an active `routes` line turns off wrangler's
 `workers.dev` default, so `provision urls` refuses site hosts while the app is on `workers.dev`.
+
+`pnpm provision urls` takes the hosts variable's value per environment from
+`--production-site-hosts` / `--staging-site-hosts` (the variable's own syntax, for the `sites`
+plugin `www.example.com=www`), else the toml, else a question on a terminal; an environment left
+empty is named in a warning, since its sites then answer nothing deployed.
 
 Removing a host from the variable does not remove its route. Until you delete the entry from
 `routes` and deploy, the host still reaches this Worker and is answered as the app.
@@ -246,7 +265,8 @@ missing, `pnpm plugin remove` (or an `upgrade` whose release drops `publicSites`
 
 | Expression | Task | What it does | Local trigger (`wrangler dev` never fires crons itself) |
 |---|---|---|---|
-| `0 4 * * *` | `pruneExpired`, `pruneAiSpans`, `pruneEvents` | deletes expired sessions, consumed/expired magic links, invitations older than 30 days; then `ai_spans` older than `OBSERVABILITY_SPAN_RETENTION_DAYS` (14), one DELETE across every tenant (D32); then `plugin_events` older than `EVENTS_RETENTION_DAYS` (7, optional var — the payloads may hold personal data, D42) | `curl "http://localhost:3001/cdn-cgi/local/scheduled?cron=0+4+*+*+*"` |
+| `0 4 * * *` | `pruneExpired`, `pruneAiSpans`, `pruneEvents`, `pruneAgentTurns` | deletes expired sessions, consumed/expired magic links, invitations older than 30 days; then `ai_spans` older than `OBSERVABILITY_SPAN_RETENTION_DAYS` (14), one DELETE across every tenant (D32); then `plugin_events` older than `EVENTS_RETENTION_DAYS` (7, optional var — the payloads may hold personal data, D42); then the tool-loop journal (`agent_run_turns`) of agent runs settled more than `AGENT_TRANSCRIPT_RETENTION_DAYS` ago (30, optional var — an active run's is never touched; runs, events and decisions are kept, D44) | `curl "http://localhost:3001/cdn-cgi/local/scheduled?cron=0+4+*+*+*"` |
+| `*/10 * * * *` | `sweepLostRuns`, `sendReminders` | `sendReminders`: one reminder per pending ask past its `remind_at` (`meta.hitl.remindAfter`), up to 100 per sweep, across tenants. `sweepLostRuns` settles agent runs whose Workflow instance ended without settling them — up to 100 active runs untouched for 10 minutes, oldest first: a `queued` row with no instance gets one, an `errored` instance → `failed`, `terminated` → `cancelled`, `complete` → `succeeded`, a park whose asks all expired → `cancelled`; a `running` or `waiting` instance is left alone (D44) | `curl "http://localhost:3001/cdn-cgi/local/scheduled?cron=*/10+*+*+*+*"` |
 | `15 * * * *` | `analytics.refreshFactTables` (the analytics PLUGIN, D31) | every registered fact table, per tenant, DELETE+INSERT in one transaction; per-tenant failures collected, logged as a warning, never abort the run. The expression is the plugin's `crons` declaration and the task is `ServerPlugin.scheduledTasks` — **a task under an expression no toml declares simply never runs** | `curl "http://localhost:3001/cdn-cgi/local/scheduled?cron=15+*+*+*+*"` — or, for one organisation, `my-app analytics refresh-facts` |
 
 Health of the fact tables: `GET /api/analytics/facts/status` (admin+; `stale` = newest source row
@@ -304,7 +324,7 @@ in **both** files, and split a heavy phase into its own step to draw a fresh bud
 
 | Kind | Where | Examples |
 |---|---|---|
-| Non-secret config | `[vars]` in each toml (committed) | `APP_ENV`, `APP_URL`, `APP_NAME`, `RELEASE_VERSION`, `LOG_LEVEL`, `EMAIL_FROM`, `TENANCY_MODE`, `SIGNUP_MODE`, `TENANT_SCOPE_MODE`, `AGENT_MAX_OUTPUT_TOKENS` (16384), `AGENT_MAX_TURNS` (30), `CHAT_KNOWLEDGE_TOOLS` (`true`), `CHAT_HISTORY_MAX_CHARS` (24000), `AGENT_MAX_ACTIVE_RUNS_PER_TENANT` (50), the optional budgets `AGENT_RUN_MAX_TOKENS` / `AGENT_RUN_MAX_COST_USD` / `AGENT_TENANT_DAILY_COST_USD` (unset = no cap, D39), `AGENT_INTERRUPT_TIMEOUT`
+| Non-secret config | `[vars]` in each toml (committed) | `APP_ENV`, `APP_URL`, `APP_NAME`, `RELEASE_VERSION`, `LOG_LEVEL`, `EMAIL_FROM`, `TENANCY_MODE`, `SIGNUP_MODE`, `TENANT_SCOPE_MODE`, `AGENT_MAX_OUTPUT_TOKENS` (16384), `AGENT_MAX_TURNS` (30), `CHAT_KNOWLEDGE_TOOLS` (`true`), `CHAT_HISTORY_MAX_CHARS` (24000), `AGENT_MAX_ACTIVE_RUNS_PER_TENANT` (50), the optional budgets `AGENT_RUN_MAX_TOKENS` / `AGENT_RUN_MAX_COST_USD` / `AGENT_TENANT_DAILY_COST_USD` (unset = no cap, D39), the optional knowledge vars `RERANK_MIN_SCORE` (unset = off) / `RERANK_CANDIDATES` (unset = 20) / `KNOWLEDGE_TENANT_DAILY_COST_USD` (unset = no cap), `AGENT_INTERRUPT_TIMEOUT`
 (`168 hours` — how long an agent run parked on a human question waits before it expires; it is
 passed verbatim to `step.waitForEvent`, so it must be a duration the platform accepts, between
 1 second and 365 days. **Instance retention is the real bound, not this**: 30 days on Paid, 3 on
@@ -647,7 +667,7 @@ Publishing the Release is the promotion gate (required reviewers are unavailable
 on the free plan; add them to the `production` environment if the plan allows). Production does not
 re-run the CI gate: it ships the tag staging validated. `RELEASE_VERSION` is a `[vars]` override at
 deploy time, surfaced by `/auth/session`, the nav footer and `my-app status`. Local
-`pnpm deploy[:staging]` (root → `apps/web`: `build:ui` + `wrangler deploy`) exist as escape hatches;
+`pnpm run deploy[:staging]` (root → `apps/web`: `build:ui` + `wrangler deploy`) exist as escape hatches;
 CI is the path. `wrangler deploy` always runs with `apps/web` as cwd so `[assets] directory =
 "./dist/ui"` resolves — never call it from the root.
 
@@ -666,7 +686,9 @@ holding the custom domains. One token may serve both environments.
 - `pnpm --filter @my-app/web exec wrangler tail [-c wrangler.staging.toml] [--format pretty]` streams live logs;
   `--status error` filters.
 - `pnpm --filter @my-app/web exec wrangler deployments list`, `… wrangler workflows instances list <name>`,
-  `… wrangler queues info <name>` for the async parts.
+  `… wrangler queues info <name>` for the async parts — `<app>-jobs-dlq[-staging]` holds every job
+  that exhausted its retries (a failed `document.reembed` resumes when re-requested:
+  `POST /api/ai/documents/reembed`; a failed document is retried from the Documents page).
 - AI traces (D32): spans for every chat turn, agent run, tool call, retrieval, embeddings batch and
   AI job land in the tenant's `ai_spans` rows (read with `my-app traces list|show`) and, when a
   backend is configured, are exported as OTLP from `waitUntil`, never on the response path —
@@ -708,7 +730,7 @@ fail a request; `wrangler tail` is where to look.
 
 | Situation | Action |
 |---|---|
-| Bad Worker version, schema unchanged | `pnpm --filter @my-app/web exec wrangler rollback [-c wrangler.staging.toml]` — previous version, seconds. Or `wrangler rollback <version-id>` from `deployments list` |
+| Bad Worker version, schema unchanged | `pnpm --filter @my-app/web exec wrangler rollback [-c wrangler.staging.toml]` — previous version, seconds. Or `wrangler rollback <version-id>` from `deployments list`. Agent runs in flight resume on the rolled-back code: a rollback that also rolls back an agent's `meta.version` applies its `onVersionChange` like any other version change |
 | Need a specific earlier tag | Actions → Deploy → `production` from that tag, or publish a Release on the earlier tag. On the deployer path a tag whose release carries `launch-bundle-<tag>.tgz` redeploys those exact bytes (build once); an older one builds from the tag |
 | Schema migration must be undone | migrations are forward-only: write a compensating migration, tag, and run the dance. `wrangler rollback` does not touch the database |
 | Bad deploy right after switching a deployment to `neon` | `wrangler rollback` to the last `postgres` version — it restores that version's `HYPERDRIVE` binding, which is why the Hyperdrive configs are kept about a week (§ Database driver). Then switch the toml back with `pnpm provision cloudflare <env> --driver postgres` before the next deploy |

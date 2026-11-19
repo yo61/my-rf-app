@@ -97,9 +97,11 @@ The one place a name leaks into code is the queue consumer: `batch.queue` is the
 **prefix** — `isJobsQueue()` / `JOBS_QUEUE_NAME_PREFIX` in `apps/web/src/api/services/jobs.ts` —
 and `ackAll()`s any queue it does not know. Renaming the queue = both tomls (`[[queues.producers]]`
 + `[[queues.consumers]]`) + that one constant (`tests/api/queue-dispatch.test.ts` pins both names).
-Prefix matching also means a `my-app-jobs-dlq` would be dispatched to the SAME consumer if you
-ever bound a consumer to it — a dead-letter queue you want to inspect rather than reprocess needs a
-name outside the prefix or its own branch in `queue.ts`.
+Prefix matching also means the jobs dead-letter queue (`my-app-jobs-dlq` /
+`my-app-jobs-dlq-staging`, `dead_letter_queue` on both consumers, created by `pnpm provision
+cloudflare`) would be dispatched to the SAME consumer if you ever bound a consumer to it — it is
+deliberately unconsumed (inspected from the dashboard); one you want to drain needs a name outside
+the prefix or its own branch in `queue.ts` (`wrangler-parity.test.ts` refuses a consumer on it).
 
 ## `[limits] cpu_ms` is per step
 
@@ -262,8 +264,13 @@ meaning loses a namespace and everything stored in it.
 
 Allowed and used: `Buffer`, `AsyncLocalStorage`, `node:crypto` hashing, `process.env` **inside
 dependencies only**. Banned in `apps/web/src/`: `pg`, `pg-boss`, `ws`, `node:fs`, `node:child_process`,
-`node:http`, `@hono/node-server`, `@opentelemetry/sdk-node`, any `setInterval` at module scope,
-`process.env` (read config via `loadConfig(env)`). `pnpm web build:api` (dry-run `wrangler deploy`) is
+`node:http`, `@hono/node-server`, `@opentelemetry/sdk-node`, `process.env` (read config via
+`loadConfig(env)`). **Nothing refused in global scope**: no `crypto.randomUUID()` /
+`getRandomValues()`, `setTimeout` / `setInterval` or `fetch` while a module loads — Cloudflare
+evaluates the top level at upload and fails the deploy (error 10021), while `wrangler dev` and the
+tests allow all of them. Make the value on first use (`let id; … id ??= crypto.randomUUID()`).
+`tests/config/global-scope.test.ts` loads `src/worker.ts`, every installed plugin included, with
+them made to throw. `pnpm web build:api` (dry-run `wrangler deploy`) is
 the check `tsc` cannot do — run it before pushing a new dependency.
 
 ## Local testing of the non-HTTP entry points

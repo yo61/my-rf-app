@@ -35,6 +35,7 @@ import { UserMenu } from '@/ui/components/UserMenu'
 import { WebSocketProvider } from '@/ui/components/WebSocketProvider'
 import { WebSocketStatus } from '@/ui/components/WebSocketStatus'
 import { AuthProvider, useAuth } from '@/ui/hooks/useAuth'
+import { KNOWLEDGE_FACTS_GUARD } from '@/ui/lib/feature-guards'
 import { NavigationBridge } from '@/ui/lib/navigation'
 import { queryClient } from '@/ui/lib/queryClient'
 import Home from '@/ui/pages/Home'
@@ -59,11 +60,15 @@ const ChatPage = lazy(() => import('@/ui/pages/chat/ChatPage'))
 // Also carries the markdown renderer (run transcripts) — lazy for the same reason.
 const AgentsPage = lazy(() => import('@/ui/pages/agents/AgentsPage'))
 const RunPage = lazy(() => import('@/ui/pages/agents/RunPage'))
+const AgentPage = lazy(() => import('@/ui/pages/agents/AgentPage'))
+const AllRunsPage = lazy(() => import('@/ui/pages/agents/AllRunsPage'))
 // The knowledge base — ingest/upload + list on /documents, hybrid search on /search.
 const DocumentsPage = lazy(() => import('@/ui/pages/documents/DocumentsPage'))
 const SearchPage = lazy(() => import('@/ui/pages/documents/SearchPage'))
 // The detail page — no SideNav entry; it is reached from the list, from Search and from a citation.
 const DocumentViewPage = lazy(() => import('@/ui/pages/documents/DocumentViewPage'))
+// Knowledge facts (D43): one entity and its facts, behind the flag.
+const EntityPage = lazy(() => import('@/ui/pages/knowledge/EntityPage'))
 const AdminLayout = lazy(() => import('@/ui/pages/admin/AdminLayout'))
 const AccessRequests = lazy(() => import('@/ui/pages/admin/AccessRequests'))
 const TenantList = lazy(() => import('@/ui/pages/admin/TenantList'))
@@ -191,6 +196,23 @@ function ShellRoutes() {
               </RequireGuard>
             }
           />
+          {/* `runs` is a static segment, so it outranks `:agentKey` — no agent may be keyed `runs`. */}
+          <Route
+            path="/agents/runs"
+            element={
+              <RequireGuard guard={{ action: 'read', subject: 'AgentRun' }}>
+                <AllRunsPage />
+              </RequireGuard>
+            }
+          />
+          <Route
+            path="/agents/:agentKey"
+            element={
+              <RequireGuard guard={{ action: 'read', subject: 'AgentRun' }}>
+                <AgentPage />
+              </RequireGuard>
+            }
+          />
           <Route
             path="/agents/runs/:runId"
             element={
@@ -216,6 +238,14 @@ function ShellRoutes() {
             element={
               <RequireGuard guard={{ action: 'read', subject: 'Document' }}>
                 <DocumentViewPage />
+              </RequireGuard>
+            }
+          />
+          <Route
+            path="/knowledge/entities/:type/:id"
+            element={
+              <RequireGuard guard={KNOWLEDGE_FACTS_GUARD}>
+                <EntityPage />
               </RequireGuard>
             }
           />

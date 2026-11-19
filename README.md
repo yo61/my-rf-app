@@ -31,7 +31,9 @@ verification line per step. Then **`/rf-adapt <slug> "Your App"`** renames the k
 **`/rf-provision`** deploys it (you type that one yourself: it creates paid resources and prompts for
 vendor tokens). **`/rf-plugin`** installs a capability as a plugin — a git repository copied into your
 app, with the plan shown before anything is written. Later, when the kit has moved on,
-**`/rf-upgrade`**.
+**`/rf-upgrade`**. Before a release that touches auth, tenancy or AI tools, **`/rf-security`** audits
+the code against your threat model; it spends model budget, so it runs only when you ask
+([`docs/SECURITY-AUDIT.md`](docs/SECURITY-AUDIT.md)).
 
 **One command.** Read [`scripts/install.sh`](scripts/install.sh) first — it is short — then:
 
@@ -99,6 +101,7 @@ you removed. [`CHANGELOG.md`](CHANGELOG.md) is what you would be catching up on.
 - **Sessions as rows** — `__Host-session` cookie, 7-day sliding TTL, one LATERAL query per request.
 - **Tenant API keys** — hashed, scoped, expirable, revocable from Settings; the Bearer path shares the auth middleware and abilities with the UI.
 - **Hardening built in** — CSRF by origin allow-list, KV sliding-window rate limits on login routes, security headers, body limits, dev-login that 404s in production, `gitleaks` in CI.
+- **A security audit you can re-run** — `/rf-security` sends independent agents after the threat model in `docs/THREAT-MODEL.md`, checks every candidate on a second model, confirms only what a test proves, runs proofs in a locked-down Docker sandbox, and keeps findings outside the repository (`docs/SECURITY-AUDIT.md`).
 
 ### Background work and realtime
 - **Jobs queue** — one `JOBS_QUEUE` with typed envelopes (`email.send`, `activity.record`, `document.index`, …); invalid messages are acked (never loop), handler errors retry with capped backoff; a missing binding throws rather than running work inline.
@@ -115,7 +118,8 @@ you removed. [`CHANGELOG.md`](CHANGELOG.md) is what you would be catching up on.
 - **Streamed chat** — conversations and messages persisted per user, SSE frames with a shared event contract, auto-titles, prompt caching breakpoints, extended thinking off unless a tenant turns it on.
 - **Prompt registry** — prompts are code with `{{variables}}`; tenants override them in Settings → Prompts and revert with one click.
 - **Agents on Workflows** — `POST /api/agents/runs` enqueues and answers 202; runs are exclusive per tenant and agent via a partial unique index, emit a durable event timeline, cancel cooperatively, and reconcile against the Workflow engine on read. The `summarize-text` example shows structured output through a forced tool call; an Agents page shows live timelines.
-- **Retrieval** — ingest text into `documents`/`chunks` (paragraph-aware chunking, inline or queued indexing), `vector(1024)` embeddings with an HNSW index, and **hybrid search**: dense cosine + lexical `tsvector`, fused with Reciprocal Rank Fusion. Vectors are ordinary tenant-scoped rows.
+- **Retrieval** — ingest text into `documents`/`chunks` (heading- and table-aware chunking with exact source spans, inline or queued indexing, duplicate text detected by content hash), `vector(1024)` embeddings with an HNSW index, and **hybrid search**: dense cosine + a stored lexical `tsvector`, fused with Reciprocal Rank Fusion, then **reranked** (Workers AI `bge-reranker-base` by default, or a tenant's Cohere/Voyage/Fireworks key). Each dense search reads only chunks of the query's embeddings model, and a model change re-embeds in the background. Embedding, rerank and extraction calls are metered, with an optional per-tenant daily cap. Vectors are ordinary tenant-scoped rows.
+- **Knowledge facts** (off by default) — register an entity type (your customers, suppliers, orders) and every new or changed document is read for typed facts about it, each kept with its quote, source, trust and validity. Disagreeing or doubtful facts go to a person for review (Confirm / Not right / Use this one), and chat answers cite both sides of a conflict instead of picking one; nothing is written into your own tables automatically.
 - **Document uploads** — PDF, Word, Excel, OpenDocument, HTML and XML are stored in R2 and converted to Markdown by Workers AI (`env.AI.toMarkdown`, free for documents) in a `document.convert` job, then indexed like pasted text; the original stays downloadable. Agents read the same knowledge base through built-in `search_knowledge` / `get_document` / `list_documents` tools.
 - **Usage ledger and tracing** — one `ai_usage` row per model call with token counts and a usage summary endpoint; vendor-neutral OTLP traces with GenAI conventions (agent → model calls, tools, retrieval, embeddings) exported to Langfuse, Phoenix or any OTLP backend from `waitUntil`, and always recorded locally so `my-app traces show <runId>` works with zero config — no OpenTelemetry dependency.
 - **Evals and feedback** — `pnpm eval` runs vitest-evals suites against the real chat route and agent runtime in-process, with deterministic judges (tool trajectory, schema, contains, budget) and LLM judges (rubric, faithfulness to what was retrieved, reference answer) that go through the kit's own model resolver; runs are JSON with committed baselines and `--compare` regression checks, plus a local report UI. Thumbs on chat replies and run output feed `my-app evals promote`, which turns a bad real answer into a draft case. The `/rf-evals` skill drives all of it.
