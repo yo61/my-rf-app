@@ -5,8 +5,8 @@
     "id": "rocketflare",
     "name": "rocketflare",
     "repo": "https://github.com/rocketflare-dev/rocketflare.git",
-    "version": "0.38.0",
-    "commit": "418b9f6446b907cedae43f82b66a50913cc029d2"
+    "version": "0.39.0",
+    "commit": "0e1eb482384fd662f0f0e4a9e155025c0ee31822"
   },
   "app": {
     "slug": "my-app",
@@ -101,6 +101,11 @@
     {
       "from": "054e6ee51b1f65d3153cc811f2be5b68dd9fd028",
       "to": "418b9f6446b907cedae43f82b66a50913cc029d2",
+      "at": "2026-11-19"
+    },
+    {
+      "from": "418b9f6446b907cedae43f82b66a50913cc029d2",
+      "to": "0e1eb482384fd662f0f0e4a9e155025c0ee31822",
       "at": "2026-11-19"
     }
   ],
