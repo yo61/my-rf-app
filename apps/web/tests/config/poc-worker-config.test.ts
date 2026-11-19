@@ -45,11 +45,12 @@ describe('workerConfig, from the real wrangler.toml', () => {
     expect(config.assets).toMatchObject({ binding: 'ASSETS' })
   })
 
-  it('names queue consumers by their producer binding, keeping their settings', () => {
+  it('names queue consumers and their dead-letter queues by binding, keeping their settings', () => {
     expect(config.queues).toEqual({
       consumers: [
         {
           queue: 'JOBS_QUEUE',
+          dead_letter_queue: 'JOBS_DLQ',
           max_batch_size: 10,
           max_batch_timeout: 5,
           max_retries: 3,
@@ -73,6 +74,18 @@ describe('workerConfig refusals', () => {
     expect(() =>
       workerConfig({ main: 'src/worker.ts', queues: { consumers: [{ queue: 'orphan' }] } })
     ).toThrow(/orphan.*no producer/)
+  })
+
+  it('refuses a dead-letter queue with no binding name', () => {
+    expect(() =>
+      workerConfig({
+        main: 'src/worker.ts',
+        queues: {
+          producers: [{ queue: 'my-app-jobs', binding: 'JOBS_QUEUE' }],
+          consumers: [{ queue: 'my-app-jobs', dead_letter_queue: 'my-app-other-dlq' }],
+        },
+      })
+    ).toThrow(/my-app-other-dlq.*no binding/)
   })
 
   it('refuses a workflow without a binding', () => {
