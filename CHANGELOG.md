@@ -6,6 +6,8 @@ Releases of this app. The kit releases it has absorbed are recorded in `.rocketf
 ## 0.6.0
 
 - The release banner is lime: release "Lime".
+- Built on kit 0.40.0 (from 0.33.0) and the analytics plugin 3.12.0. The jobs queue has a
+  dead-letter queue, which the PoC artefact names by its `JOBS_DLQ` binding.
 
 ## 0.5.0
 
