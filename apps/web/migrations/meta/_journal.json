@@ -197,6 +197,13 @@
       "when": 1795081150538,
       "tag": "0027_kit-knowledge-chunks-facts-origin",
       "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1795081313109,
+      "tag": "0028_kit-knowledge-judgements-and-refs",
+      "breakpoints": true
     }
   ]
 }
