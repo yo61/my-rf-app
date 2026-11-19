@@ -5,8 +5,8 @@
     "id": "rocketflare",
     "name": "rocketflare",
     "repo": "https://github.com/rocketflare-dev/rocketflare.git",
-    "version": "0.34.0",
-    "commit": "a4995dccc962b3f4463195038715058759fb6b8a"
+    "version": "0.35.0",
+    "commit": "f9545f29fb84ecf27013d2ee32f17ccc64b9c12f"
   },
   "app": {
     "slug": "my-app",
@@ -76,6 +76,11 @@
     {
       "from": "f3cfeb22f7066b217e6451aad23cbb0255fc2d0c",
       "to": "a4995dccc962b3f4463195038715058759fb6b8a",
+      "at": "2026-11-19"
+    },
+    {
+      "from": "a4995dccc962b3f4463195038715058759fb6b8a",
+      "to": "f9545f29fb84ecf27013d2ee32f17ccc64b9c12f",
       "at": "2026-11-19"
     }
   ],
@@ -346,6 +351,14 @@
           "at": "2026-11-10"
         }
       ]
+    },
+    {
+      "id": "threat-model",
+      "kind": "example",
+      "label": "The threat model the security audit reads",
+      "anchor": "docs/THREAT-MODEL.md",
+      "paths": ["docs/THREAT-MODEL.md"],
+      "registries": []
     }
   ],
   "neverPort": [
@@ -392,7 +405,8 @@
     "apps/*/package.json",
     "packages/*/package.json",
     ".github/workflows/**",
-    "apps/web/src/ui/components/shared/LogoMark.tsx"
+    "apps/web/src/ui/components/shared/LogoMark.tsx",
+    "docs/THREAT-MODEL.md"
   ],
   "core": [
     "apps/web/src/**",

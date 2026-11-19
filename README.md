@@ -31,7 +31,9 @@ verification line per step. Then **`/rf-adapt <slug> "Your App"`** renames the k
 **`/rf-provision`** deploys it (you type that one yourself: it creates paid resources and prompts for
 vendor tokens). **`/rf-plugin`** installs a capability as a plugin — a git repository copied into your
 app, with the plan shown before anything is written. Later, when the kit has moved on,
-**`/rf-upgrade`**.
+**`/rf-upgrade`**. Before a release that touches auth, tenancy or AI tools, **`/rf-security`** audits
+the code against your threat model; it spends model budget, so it runs only when you ask
+([`docs/SECURITY-AUDIT.md`](docs/SECURITY-AUDIT.md)).
 
 **One command.** Read [`scripts/install.sh`](scripts/install.sh) first — it is short — then:
 
