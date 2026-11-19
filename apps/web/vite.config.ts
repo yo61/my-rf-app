@@ -42,6 +42,8 @@ export default defineConfig({
   build: {
     outDir: '../../dist/ui',
     emptyOutDir: true,
+    // Analytics' drizzle-cube runtime and exceljs are lazy, unsplittable chunks of about 0.9 MB.
+    chunkSizeWarningLimit: 1000,
   },
   server: {
     port: ports.ui,

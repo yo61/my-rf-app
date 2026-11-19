@@ -229,7 +229,7 @@ async function tenantName(db: Database, tenantId: string): Promise<string> {
 export async function createInvitation(
   db: Database,
   cfg: AppConfig,
-  logger: InviteLogger,
+  _logger: InviteLogger,
   jobs: JobsQueue,
   input: InviteInput
 ): Promise<{ invitation: Invitation; token: string }> {
@@ -349,7 +349,7 @@ export async function bulkInvite(
 export async function resendInvitation(
   db: Database,
   cfg: AppConfig,
-  logger: InviteLogger,
+  _logger: InviteLogger,
   jobs: JobsQueue,
   input: { tenantId: string; id: string; inviter: User; actor: RoleView }
 ): Promise<Invitation> {
