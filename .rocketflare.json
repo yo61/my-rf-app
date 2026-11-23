@@ -5,8 +5,8 @@
     "id": "rocketflare",
     "name": "rocketflare",
     "repo": "https://github.com/rocketflare-dev/rocketflare.git",
-    "version": "0.40.0",
-    "commit": "bc06e2632918a4025d4ac9535ea2fb52cd07f655"
+    "version": "0.41.0",
+    "commit": "2d5782cf8696ef466f35d75fead14a603798b787"
   },
   "app": {
     "slug": "my-app",
@@ -18,7 +18,7 @@
     {
       "id": "analytics",
       "repo": "https://github.com/rocketflare-dev/rocketflare-plugins.git",
-      "ref": "3.12.0",
+      "ref": "3.14.0",
       "subdir": "plugins/analytics"
     }
   ],
@@ -112,6 +112,11 @@
       "from": "0e1eb482384fd662f0f0e4a9e155025c0ee31822",
       "to": "bc06e2632918a4025d4ac9535ea2fb52cd07f655",
       "at": "2026-11-19"
+    },
+    {
+      "from": "bc06e2632918a4025d4ac9535ea2fb52cd07f655",
+      "to": "2d5782cf8696ef466f35d75fead14a603798b787",
+      "at": "2026-11-23"
     }
   ],
   "surfaces": [
@@ -347,11 +352,11 @@
       "source": {
         "repo": "https://github.com/rocketflare-dev/rocketflare-plugins.git",
         "subdir": "plugins/analytics",
-        "version": "3.12.0",
-        "commit": "2b5b3cb90c3923a5ffc845d6aaf5c7d6c56fe01a"
+        "version": "3.14.0",
+        "commit": "c3957bdbed50d0ad43a7df3717debb0d9016c73e"
       },
       "installedAt": "2026-11-02",
-      "minKit": "0.29.0",
+      "minKit": "0.41.0",
       "requires": {
         "surfaces": [],
         "plugins": []
@@ -384,6 +389,11 @@
           "from": "9a7f3428eb06c4cd2b13eb915b9b4ce1cb2ea6b5",
           "to": "2b5b3cb90c3923a5ffc845d6aaf5c7d6c56fe01a",
           "at": "2026-11-19"
+        },
+        {
+          "from": "2b5b3cb90c3923a5ffc845d6aaf5c7d6c56fe01a",
+          "to": "c3957bdbed50d0ad43a7df3717debb0d9016c73e",
+          "at": "2026-11-23"
         }
       ]
     },
