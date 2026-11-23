@@ -26,10 +26,12 @@
  */
 
 import { ERROR_CODES } from '@my-app/shared/errors'
+import { isEmbeddableMimeType } from '@my-app/shared/files'
 import type { GroupRef, ResourceVisibility } from '@my-app/shared/groups'
 import type { JobEnvelope, JobInput } from '@my-app/shared/jobs'
 import type { PaginationMeta, PaginationQuery } from '@my-app/shared/pagination'
 import type { Actions, Subjects } from '@my-app/shared/permissions'
+import { apiKeyIdOf } from '../../api/auth/api-key-session'
 import { can as canDo, guardPermission } from '../../api/middleware/permissions'
 import type { SetResourceGroupsInput } from '../../api/services/access'
 import type { AccessScope } from '../../api/services/access-sql'
@@ -169,6 +171,16 @@ export interface RequestCtx extends PluginContext, PluginAuth {
     total: number,
     query: PaginationQuery
   ): { items: T[]; pagination: PaginationMeta }
+  /**
+   * Let a same-origin page FRAME this one response (`X-Frame-Options: SAMEORIGIN` + CSP
+   * `frame-ancestors 'self'` instead of `DENY` + `'none'`) — the opt-in `/api/files/:id` uses for
+   * the document viewer's PDF embed. Pass the content type of the body you are about to return,
+   * read from YOUR row, never from the request: only an `EMBEDDABLE_MIME_TYPES` type
+   * (`@my-app/shared/files`, today `application/pdf`) is let through, and the answer says
+   * whether it was. Call it before any early return (an `If-None-Match` 304 included), or a
+   * revalidation from inside the frame loses the header and the embed goes blank.
+   */
+  embeddable(contentType: string): boolean
 
   // ---- side effects ---------------------------------------------------------------------------
 
@@ -270,6 +282,7 @@ export function requestCtx(c: AppContext): RequestCtx {
 
     user: route.user,
     userId: route.user.id,
+    apiKeyId: apiKeyIdOf(auth),
     tenantId: route.tenantId,
     role: auth.tenantUser?.role ?? null,
     isAdmin: isAdminLevel(auth),
@@ -330,6 +343,12 @@ export function requestCtx(c: AppContext): RequestCtx {
       (c.req as unknown as { valid(t: string): T }).valid(target),
 
     page: (items, total, query) => paginated(items, total, query),
+    embeddable: contentType => {
+      const type = contentType.split(';')[0]?.trim().toLowerCase() ?? ''
+      if (!isEmbeddableMimeType(type)) return false
+      c.set('embeddable', true)
+      return true
+    },
 
     defer: route.defer,
     enqueue: (input, options) => enqueueJob(c.env.JOBS_QUEUE, input, options),

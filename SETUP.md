@@ -19,9 +19,26 @@ Legend: `[ready]` works out of the box · `[config]` needs your configuration
 
 **Fix missing prerequisites proactively rather than reporting them.** If Node is missing or too
 old, install 26 (`nvm install` reads `.nvmrc`, or `fnm use`, or the system package manager). If
-pnpm is missing, `corepack enable` (it reads `packageManager` from the root `package.json`). If
+pnpm is missing, `npm i -g pnpm@<the packageManager version>` from that Node (Node 26 ships no
+corepack; where one exists, `corepack enable` also works). If
 Docker is unavailable on macOS, `brew install colima docker && colima start`; on Linux install Docker
 Engine and add your user to the `docker` group. Confirm the tool works, then carry on.
+
+**Windows (WSL2) — before you start.** Three things stop a fresh Windows PC before the bootstrap
+can run, and `bash scripts/bootstrap.sh` names each one (`scripts/lib/prereqs.sh`):
+1. **A normal Ubuntu user.** A distro with only `root` is refused (correctly). In it:
+   `adduser <name> && usermod -aG sudo <name>`; then from Windows PowerShell
+   `wsl -d <distro> -u <name>` (`wsl --manage <distro> --set-default-user <name>` makes it the
+   default). Clone the kit into the Linux home (`~`), not under `/mnt/c`.
+2. **Docker Desktop's WSL integration.** Settings → Resources → WSL integration → turn on the
+   distro → Apply, then **quit Docker Desktop and start it again** — restarting the distro is not
+   enough. `docker version` inside the distro must answer.
+3. **Node 26 through a version manager.** The bootstrap installs Node only through nvm or fnm
+   that is already there: `curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash`,
+   open a new shell, `nvm install 26`.
+WSL appends Windows' PATH to the distro's, so `corepack`, `pnpm` or `node` may resolve to a
+Windows copy under `/mnt/c` (a CRLF script: `/bin/sh^M: bad interpreter`). The bootstrap ignores any
+of them on a Windows drive and installs pnpm with the active Node's own `npm`.
 
 ---
 
@@ -32,8 +49,9 @@ Engine and add your user to the `docker` group. Confirm the tool works, then car
 > line each, a `✖` line plus a `fix:` hint on the first failure — and ends with the browser open at
 > `http://localhost:3000/login?as=owner@example.test`. macOS or Linux (Windows: WSL2). Re-runnable on
 > a half-done machine: it inspects before it acts and never overwrites a value you wrote. Flags:
-> `--offline` (no Cloudflare account: comments the `[ai]` block out of both tomls), `--online`
-> (restore it), `--no-demo` (plain `pnpm seed`), `--no-plugins` (do not install `defaultPlugins`,
+> `--offline` (no Cloudflare account: `DEV_WORKERS_AI=off` in `.dev.vars`, local `wrangler dev`
+> runs without Workers AI and no tracked file changes, §1.6), `--online` (turn it back on),
+> `--no-demo` (plain `pnpm seed`), `--no-plugins` (do not install `defaultPlugins`,
 > §1.4b), `--no-dev` (stop after step 8 and print what to run next), `--no-open`,
 > `--as <email>`, `--yes`, `--verbose`, `--db-url <url>` (an existing Postgres instead of Docker,
 > §1.4); `--check` is `pnpm preflight`. `--offline` never runs `wrangler whoami`, so step 8 makes
@@ -91,6 +109,12 @@ pnpm db:migrate       # db-roles --phase=role → migrations → db-roles --phas
 Verify: `db:up` prints the port it chose; `db:check` prints the server version; `db:migrate` ends
 with the applied migration count and no `role "my_app_app" does not exist` error.
 
+After a schema change, `pnpm db:generate` writes the migration and then applies every migration to
+a scratch database it creates beside this one and drops: `✔ scratch check` means the new SQL
+applies to an empty database; a `✖` names the statement Postgres refused, in the file not yet
+applied anywhere — fix it by hand (`.claude/rules/database.md`), then `pnpm db:generate --check`.
+A non-local `DATABASE_URL` skips the check with a note.
+
 **The port is chosen, not fixed.** `dev:db:up` runs `apps/web/scripts/dev-db.mjs`, which gives this
 checkout its own compose project, container and port: it keeps the port already in `DATABASE_URL`
 whenever that is still free or still this checkout's, and otherwise takes the next free one from
@@ -136,6 +160,7 @@ included, lands in your shell history.
 ### 1.4b Plugins `[ready]`
 ```bash
 pnpm plugin list                  # what is installed (id, version, repo, when)
+pnpm plugin list --available      # what could be: every published plugin, read live
 pnpm plugin check                 # audit them: exit 1 with one line per failure
 ```
 A **plugin** is a git repository copied into this app — never an npm package — that contributes
@@ -172,10 +197,18 @@ cron or `[vars]` key it declares is written into both tomls by `pnpm provision c
 ```bash
 pnpm seed             # idempotent: demo tenant, owner/admin/member users, one API key
 pnpm seed --demo      # the same, plus a populated workspace (what the bootstrap runs; or SEED_DEMO=1)
+pnpm seed --feature hotel                 # + a per-organisation override: on for the seeded tenant
+pnpm seed --feature hotel=off@other-org   # off for the tenant with that slug (repeatable)
 ```
 `pnpm seed` creates the tenant `Acme` (`acme`), `owner@` / `admin@` / `member@example.test`, a
 pending invitation for `invited@example.test`, the global admin `admin@my-app.example.com` and one API
-key. `--demo` additionally fills that workspace with a logistics company in use (the tenant is
+key. The accounts are `DEV_ACCOUNTS` in `apps/web/src/ui/lib/dev-accounts.ts` — the same list the
+login page's **Dev quick login** buttons read, so an app edits its accounts there once. The API key
+prints on a line labelled `api key:` and the invite link as a `local demo link`: both are values
+for this machine's database only, safe to discard. Each installed plugin's `hooks.seed` runs on
+every `pnpm seed` (its reference data, and the per-organisation flag that shows it); `--feature
+<key>[=on|off][@<tenant-slug>]` writes the same override `/admin/feature-flags` does, after the
+plugins and the demo, so it has the last word. `--demo` additionally fills that workspace with a logistics company in use (the tenant is
 renamed `Acme Logistics` in `multi` mode) — more members, two
 sibling tenants, two weeks of activity, conversations, an indexed knowledge base, finished agent
 runs (`summarize-text`, `research-topic`), an AI usage ledger and rebuilt fact tables — so every
@@ -183,7 +216,7 @@ page has something to show. Every demo row has a fixed id and is inserted `onCon
 re-running adds nothing; the chunk vectors are deterministic stand-ins (`embeddingModel:
 'seed:deterministic'`), so a seeded passage is found by the lexical half of the hybrid search, not
 the dense half. Local database only — it is a `tsx` script over `DATABASE_URL`.
-Verify: the output lists the seeded emails and prints the API key **once** (on the first run only;
+Verify: the output lists the seeded emails and prints the `api key:` line **once** (on the first run only;
 later runs say it already exists); with `--demo` it ends with a "Workspace `acme` now holds" table.
 `pnpm db:studio` shows the rows.
 
@@ -208,19 +241,24 @@ pnpm dev              # apps/web: wrangler dev :3001 + vite :3000 (strict ports;
 > **Cloudflare login and the AI binding.** `wrangler dev` runs everything locally EXCEPT the Workers AI
 > binding (`[ai]` in `apps/web/wrangler.toml`), which always calls Cloudflare — so the first `pnpm dev`
 > on a machine that has never run `pnpm web exec wrangler login` will ask you to log in (a free account
-> is enough). To stay fully offline, comment out the `[ai]` block in BOTH tomls (the parity test keeps
-> them in sync): `pnpm bootstrap --offline` does exactly that, and `pnpm bootstrap --online` restores
-> it. Chat then needs a key or a tenant provider (§2.5) and embeddings resolve to `EMBEDDINGS_API_KEY`
-> or report "not configured". After toggling, `pnpm typecheck` regenerates
-> `apps/web/worker-configuration.d.ts` without `AI` — restore the block (`--online`) before
-> committing so CI's typegen diff stays clean.
+> is enough). To stay fully offline, set `DEV_WORKERS_AI=off` in `apps/web/.dev.vars` (or the
+> shell): `pnpm bootstrap --offline` writes it and `pnpm bootstrap --online` sets it back to `on`.
+> Every local `wrangler dev` then runs from `apps/web/.wrangler.offline.toml`, a git-ignored copy of
+> `wrangler.toml` without `[ai]` that is regenerated at each launch; the tracked tomls and
+> `worker-configuration.d.ts` never change, so there is nothing to keep out of a commit. Chat then
+> needs a key or a tenant provider (§2.5) and embeddings resolve to `EMBEDDINGS_API_KEY` or report
+> "not configured". Do not comment the `[ai]` block out for this (an older bootstrap did): any
+> `pnpm bootstrap` run puts it back in both tomls and moves the choice to `.dev.vars`.
 
 Verify: both processes report ready; `curl -s localhost:3001/api/health` returns `{"status":"ok",…}`;
 http://localhost:3000 renders the shell. Sign in: enter the seeded owner email, copy the magic-link
 URL from the **wrangler dev console** (no `RESEND_API_KEY` → links are logged, not sent), open it,
 press **Sign in** on the confirm page, land on Home. Shortcut (dev only): `http://localhost:3000/login?as=owner@example.test` signs in
 through `/auth/dev-login` on load — honoured only when the server reports `devLogin`
-(`APP_ENV=development`) and for the four seeded accounts, so an arbitrary address does nothing.
+(`APP_ENV=development`). The page's shortcut acts only for the seeded `DEV_ACCOUNTS`, but the
+endpoint itself has no such list: in development, `POST /auth/dev-login` signs in ANY email
+address, with no password or link, and creates the user if it does not exist. It answers 404
+everywhere `APP_ENV` is not `development`.
 
 **Analytics check** (still in 1.6 — same terminal pair). Analytics is an opt-in PLUGIN
 (`docs/CONCEPTS.md` §8, §16) that the bootstrap does not install, so this applies only once you
@@ -277,7 +315,7 @@ scripts, `MY_APP_API_KEY` + `MY_APP_URL` in the environment replace the config f
 ### 1.8 Tests
 ```bash
 pnpm test             # starts Postgres on :5433 + the Neon proxy on :4433 (apps/web/docker-compose.test.yml),
-                      # then every package: web api + api-isolated + driver (real DB), ui (jsdom), config (no DB);
+                      # then every package: web api + api-isolated + api-fixtures + driver (real DB), ui (jsdom), config (no DB);
                       # cli — and the driver project again under the neon driver (the seam's conformance pass)
 # No Docker (a coding sandbox's gate): the same command against a throwaway Neon GATE branch —
 # DATABASE_URL + TEST_DATABASE_BRANCH=gate-<short>-<n> + TEST_DATABASE_ENDPOINT=ep-… (docs/CONCEPTS.md
@@ -303,7 +341,15 @@ adapter carries its MCP transport, `docs/DEPLOY.md` "Bundle size" — and `pnpm 
 `@duckdb/node-api` peer warning; neither is a problem.
 
 ### 1.10 Public URL via tunnel `[ready]` (optional)
-For OAuth callbacks, emailed magic links or webhooks against your laptop:
+For OAuth callbacks, emailed magic links or webhooks against your laptop.
+
+> **While the tunnel runs, your development instance is on the public internet, dev sign-in
+> included.** `POST /auth/dev-login` takes no password and accepts any email (§1.6), so anyone who
+> learns the tunnel's hostname can sign in as any user — the owner, a global admin — read
+> everything in the local database, mint API keys and spend whatever AI and email keys
+> `.dev.vars` holds. Use dummy data only, keep real provider keys out of `.dev.vars` while it is
+> up, and stop the tunnel (Ctrl-C) as soon as you are done.
+
 ```bash
 pnpm web cfld setup   # once: picks a Cloudflare zone, stores apps/web/.cfld.json (git-ignored)
 pnpm dev:tunnel       # cfld → :3000; apps/web/scripts/tunnel-dev.mjs passes the URL to wrangler as APP_URL
@@ -649,14 +695,25 @@ turns a bad answer into a case. Everything else — suites, judges, baselines, C
 
 ### 2.7 Plugins `[ready]` (D31)
 
-Analytics is not part of the kit; it is the opt-in `analytics` PLUGIN (dashboards, cubes, the
-drizzle-cube API). `.rocketflare.json` `defaultPlugins` is empty, so the bootstrap installs nothing
-and a fresh clone has no dashboards until you add it — `/rf-plugin add analytics`, or by hand:
+**What exists:** `pnpm plugin list --available` prints every published plugin — id, version,
+whether it is installed here, and its one-line description — read live from
+`rocketflare-dev/rocketflare-plugins` at its newest release tag (exit 3 if it cannot be reached;
+there is no cached list). When your git credentials can read
+`rocketflare-dev/rocketflare-commercial-plugins`, its plugins follow under a separate
+`Commercial plugins` heading with a `licence:` line: they are licensed separately. To browse rather
+than install, see https://rocketflare.dev/plugins. Check it before building a feature: the order is
+an existing plugin, else build it in the app, and write a plugin only for something meant to be
+installed in another app too.
+
+`.rocketflare.json` `defaultPlugins` is empty, so the bootstrap installs nothing and a fresh clone
+has none — not even analytics (dashboards, cubes, the drizzle-cube API), which is an opt-in plugin
+like the rest. Add one with `/rf-plugin add <id>` (`/rf-plugin add` alone shows the list), or by
+hand — with no `@ref`, a repository is read at its newest release tag:
 
 ```bash
-pnpm plugin add https://github.com/rocketflare-dev/rocketflare-plugins.git@3.8.2 \
+pnpm plugin add https://github.com/rocketflare-dev/rocketflare-plugins.git \
   --subdir plugins/analytics                       # read the plan; re-run with --apply
-pnpm db:generate --name plugin-analytics-3.8.2 && pnpm db:migrate   # the host's migration
+pnpm db:generate --name plugin-analytics-<version> && pnpm db:migrate   # the host's migration
 ```
 
 Then run the plan's numbered steps (below). An app that wants it on every fresh clone lists it in
@@ -673,7 +730,7 @@ pnpm plugin add <repo|path>[@ref]                  # read the plan; --apply inst
 Worker and database access — it is as trusting as merging a pull request — and the plan is what you
 say yes to. It will never generate a migration, edit a wrangler toml or write a resource id: those
 arrive as numbered steps you run yourself. The analytics plugin's are the `15 * * * *` cron and the
-`/cubejs-api` + `/mcp` prefixes in both tomls, and two `resolve` entries plus two proxy lines in
+`/cubejs-api` prefix in both tomls, and a `resolve` alias plus a proxy line in
 `apps/web/vite.config.ts`.
 
 **The drizzle-cube CLI / Claude Code plugin** (optional, with analytics installed): create
@@ -698,8 +755,8 @@ and then deleted.
 
 ### 2.8 Feature flags `[ready]` (D30)
 
-Nothing to configure — flags work out of the box. The kit core ships one, `knowledge-facts`
-(default off; §2.5 "Knowledge facts"). The inert demo flag (`example-feature`, a nav item, a page
+Nothing to configure — flags work out of the box. The kit core ships two: `knowledge-facts`
+(default off; §2.5 "Knowledge facts") and `mcp` (environment-gated; §2.10). The inert demo flag (`example-feature`, a nav item, a page
 and a notes API) belongs to the reference PLUGIN of the same name (D31,
 `apps/web/src/plugins/example-feature/`), which is installed by default and safe to delete. As a global admin, open **Admin → Feature flags**: set it to On and the nav item appears; to
 Rollout and the percentage decides deterministically; force it on or off for one organisation and
@@ -721,6 +778,40 @@ Verify: `pnpm cli features list --json` prints the effective flags for your tena
 ### 2.9 Rebrand checklist
 See [`docs/ADAPTING.md`](docs/ADAPTING.md) §1 — package names (`@my-app/*`), worker names, DB names,
 CLI bin / config dir / env prefix, themes, logo, `EMAIL_FROM`.
+
+### 2.10 MCP server — let AI clients connect `[ready]`
+
+The app is an MCP server at `<APP_URL>/mcp` (`docs/CONCEPTS.md` §19). It ships dark:
+
+1. Add `mcp` to `FEATURES_ENABLED` — in `apps/web/.dev.vars` locally, and in BOTH tomls' `[vars]`
+   for a deployed environment (comma-separated with any other key).
+2. As an owner or admin, open **Settings → MCP**, turn it on, and choose what is exposed (all
+   read-only tools by default) and who may connect (everyone by default).
+3. Paste the server URL into the client (Claude: Settings → Connectors → Add custom connector;
+   Claude Code: `claude mcp add --transport http <name> <APP_URL>/mcp`; ChatGPT: a custom
+   connector). The client finds the app's authorization server itself, opens the app's own sign-in
+   page, and shows a consent screen where the person picks the organisation. `<APP_URL>/mcp/t/<slug>`
+   is the same server pinned to one organisation — use it to connect a second organisation from a
+   client that allows one connector per URL (claude.ai).
+4. A client must reach the app on a public https URL to sign in (`APP_URL`); locally that means a
+   tunnel. Clients identify themselves with a metadata document (CIMD) — Claude and ChatGPT do;
+   clients that only support dynamic registration (Cursor) cannot connect.
+   `pnpm dev:tunnel` gives a persistent public URL. Claude and Claude Code connect to it;
+   ChatGPT does not, because chatgpt.com refuses the metadata fetch from local `wrangler dev`
+   (workerd) with a 403 — a deployed Worker fetches it fine, so test ChatGPT on staging.
+   **The tunnel makes the whole development instance public, its password-less dev sign-in
+   included** (§1.10): anyone with the URL can sign in as any user. Connect a client with dummy
+   data only and stop the tunnel when you are done; test with real data on staging.
+
+Optional vars, undeclared = the default: `MCP_GRANT_IDLE_DAYS` (30), `MCP_GRANT_MAX_DAYS` (90),
+`MCP_CALL_RETENTION_DAYS` (90), `MCP_CALLS_PER_GRANT_PER_MINUTE` (60),
+`MCP_CALLS_PER_USER_PER_MINUTE` (120 — one person across all their connections in an
+organisation), `MCP_CALLS_PER_TENANT_PER_MINUTE` (600).
+
+Verify: `curl -si -X POST <APP_URL>/mcp` answers 401 with a `WWW-Authenticate: Bearer
+resource_metadata="…"` header, and `curl -s <APP_URL>/.well-known/oauth-authorization-server`
+answers the metadata with `"client_id_metadata_document_supported": true` (404 for either means
+`mcp` is not in `FEATURES_ENABLED`).
 
 ---
 

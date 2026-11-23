@@ -211,6 +211,13 @@
       "when": 1795081430908,
       "tag": "0029_kit-agent-run-turns-and-phase3",
       "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1795423503332,
+      "tag": "0030_kit-mcp",
+      "breakpoints": true
     }
   ]
 }

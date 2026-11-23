@@ -17,7 +17,7 @@ import {
 } from '@heroicons/react/24/outline'
 import type { AnalyticsPage, FactTableStatus } from '@my-app/shared/plugins/analytics/index'
 import { useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router'
 import {
   AccessBadge,
   ConfirmModal,

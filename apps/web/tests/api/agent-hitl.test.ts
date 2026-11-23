@@ -1,6 +1,4 @@
-// @vitest-isolate
-// Swaps entries in the `AGENTS` registry (an agent with `meta.hitl`) and mocks the plugin barrels
-// to register the fixture agents (tests/helpers/fixture-agents.ts).
+// @vitest-fixture-agents
 /**
  * HITL upgrades (D44 phase 3):
  *   - `askTiming`: `meta.hitl.timeout` capped at `AGENT_INTERRUPT_TIMEOUT`; no reminder at or past
@@ -41,16 +39,12 @@ import {
 import { setupTestDatabase } from '../helpers/db'
 import { FIXTURE_AGENT } from '../helpers/fixture-agents'
 import { json, request } from '../helpers/request'
+import { itSweeps } from '../helpers/sweeps'
 import { createTestEnv, stubs, type TestEnv } from '../mocks/bindings'
 
-vi.mock('@my-app/shared/plugins', async importOriginal =>
-  (await import('../helpers/fixture-agents')).withFixtureShared(await importOriginal())
-)
-vi.mock('@/plugins/server', async importOriginal =>
-  (await import('../helpers/fixture-agents')).withFixtureServer(await importOriginal())
-)
-
 const db = setupTestDatabase()
+// The two timeout cases backdate a park and sweep: one sweep at a time across files.
+const sweepIt = (name: string, body: () => Promise<void>) => itSweeps(db, name, body)
 const originals = { ...AGENTS }
 afterEach(() => {
   Object.assign(AGENTS, originals)
@@ -230,7 +224,7 @@ describe('reminders', () => {
 })
 
 describe("onTimeout: 'reject'", () => {
-  it('answers an expired ask as a rejection by nobody and wakes the run', async () => {
+  sweepIt('answers an expired ask as a rejection by nobody and wakes the run', async () => {
     withHitl(FIXTURE_AGENT, { onTimeout: 'reject' })
     const env = createTestEnv()
     const { tenant, run, ask } = await parkedOn(
@@ -257,7 +251,7 @@ describe("onTimeout: 'reject'", () => {
     })
   })
 
-  it('without it, an expired park is cancelled as before', async () => {
+  sweepIt('without it, an expired park is cancelled as before', async () => {
     const env = createTestEnv()
     const { tenant, run } = await parkedOn(
       env,

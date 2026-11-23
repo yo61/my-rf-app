@@ -23,6 +23,7 @@
  * builds. `makeRequestCtx` is the exception and says so on itself.
  */
 
+import { isEmbeddableMimeType } from '@my-app/shared/files'
 import type { GroupRef } from '@my-app/shared/groups'
 import type { PaginationQuery } from '@my-app/shared/pagination'
 import type { Actions, Subjects } from '@my-app/shared/permissions'
@@ -96,6 +97,8 @@ export interface RequestCtxOptions extends BaseOptions {
   /** The active organisation — the only tenant id a query may filter by. */
   tenantId: string
   userId?: string
+  /** The API key the request came in on — `null` (the default) is a browser session. */
+  apiKeyId?: string | null
   /** A real row when the test has one; otherwise a plausible one is built from `userId`. */
   user?: User
   role?: MembershipRole | null
@@ -125,6 +128,8 @@ export interface RequestCtxOptions extends BaseOptions {
  */
 export type FakeRequestCtx = RequestCtx & {
   readonly deferred: ReadonlyArray<() => Promise<unknown>>
+  /** Whether `ctx.embeddable(...)` let the response be framed — there is no response to read. */
+  readonly framed: boolean
   /** Run everything deferred so far, swallowing failures exactly as `defer` does. */
   settle(): Promise<void>
 }
@@ -179,6 +184,7 @@ export function makeRequestCtx(options: RequestCtxOptions): FakeRequestCtx {
   const isAdmin = isGlobalAdmin || role === 'owner' || role === 'admin' || role === 'support'
   const isOwner = isGlobalAdmin || role === 'owner'
 
+  let framed = false
   const deferred: Array<() => Promise<unknown>> = []
   const defer = (fn: () => Promise<unknown>) => {
     deferred.push(fn)
@@ -201,6 +207,7 @@ export function makeRequestCtx(options: RequestCtxOptions): FakeRequestCtx {
 
     user,
     userId,
+    apiKeyId: options.apiKeyId ?? null,
     tenantId: options.tenantId,
     role,
     isAdmin,
@@ -253,6 +260,16 @@ export function makeRequestCtx(options: RequestCtxOptions): FakeRequestCtx {
     },
 
     page: <T>(items: T[], total: number, query: PaginationQuery) => paginated(items, total, query),
+    // The same decision as the real adapter, recorded on `framed` instead of a header.
+    embeddable: contentType => {
+      const type = contentType.split(';')[0]?.trim().toLowerCase() ?? ''
+      if (!isEmbeddableMimeType(type)) return false
+      framed = true
+      return true
+    },
+    get framed() {
+      return framed
+    },
 
     defer,
     enqueue: async (input, opts) => {
@@ -499,7 +516,7 @@ export interface ToolCtxOptions extends BaseOptions {
 }
 
 /**
- * What `ServerPlugin.agentTools(ctx)` is handed, through the kit's own `toolCtx` adapter.
+ * What `ServerPlugin.tools(ctx)` is handed, through the kit's own `toolCtx` adapter.
  *
  * The tenant arrives as part of a `scope`, not as a bare id, and that is the whole safety property:
  * a tool bound to a scope answers what the person who STARTED the run may read. A `tenantId` on a

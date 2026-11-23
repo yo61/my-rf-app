@@ -8,7 +8,12 @@
 import type { Hono, MiddlewareHandler } from 'hono'
 import { serverPlugins } from '../plugins/server'
 import { authMiddleware, globalAdminMiddleware } from './middleware/auth'
-import { apiBodyLimit, isUnderPrefix, jsonBodyLimit } from './middleware/body-limit'
+import {
+  apiBodyLimit,
+  isUnderPrefix,
+  jsonBodyLimit,
+  pluginUploadLimits,
+} from './middleware/body-limit'
 import { configMiddleware } from './middleware/config'
 import { corsMiddleware } from './middleware/cors'
 import { csrfProtection } from './middleware/csrf'
@@ -44,21 +49,29 @@ import { invitationsRouter } from './routes/invitations'
 import { inviteRouter } from './routes/invite'
 import { keysRouter } from './routes/keys'
 import { knowledgeRouter } from './routes/knowledge'
+import { mcpDeploymentGate, mcpRouter } from './routes/mcp'
+import { mcpConnectionsRouter } from './routes/mcp-connections'
+import { mcpSettingsRouter } from './routes/mcp-settings'
 import { meRouter } from './routes/me'
 import { membersRouter } from './routes/members'
 import { notificationsRouter } from './routes/notifications'
+import { oauthRouter, wellKnownRouter } from './routes/oauth'
 import { tenantRouter } from './routes/tenant'
 import { tenantsRouter } from './routes/tenants'
 import { tracesRouter } from './routes/traces'
 import { wsRouter } from './routes/ws'
 import type { AppEnv } from './types'
-import { isApiPath } from './utils/routes/api-prefixes'
+import { assertNoReservedPluginPaths, isApiPath } from './utils/routes/api-prefixes'
 import { createRouter } from './utils/routes/router'
 
 const app = createRouter()
 
 /** Every installed plugin's unauthenticated mounts — read twice below (body cap, then routes). */
 const publicMounts = serverPlugins.flatMap(p => p.publicMounts ?? [])
+
+// The MCP server and its authorization server own `/mcp`, `/oauth` and the OAuth `.well-known`
+// documents; a plugin claiming any of them would shadow or impersonate them. Refused at load.
+assertNoReservedPluginPaths(serverPlugins)
 
 // 1. Error envelope first so every later failure (including config validation) uses it.
 app.onError(errorHandler)
@@ -87,7 +100,8 @@ app.use(
   '/api/*',
   apiBodyLimit(
     publicBodyLimitOverrides(publicMounts),
-    serverPlugins.flatMap(p => p.uploadPaths ?? [])
+    serverPlugins.flatMap(p => p.uploadPaths ?? []),
+    pluginUploadLimits(serverPlugins)
   )
 )
 // A plugin may own a prefix outside `/api` (a protocol endpoint); it gets the JSON cap too.
@@ -95,6 +109,9 @@ for (const prefix of serverPlugins.flatMap(p => p.apiPrefixes ?? [])) {
   if (!isUnderPrefix(prefix, '/api')) app.use(`${prefix}/*`, jsonBodyLimit)
 }
 app.use('/auth/*', jsonBodyLimit)
+app.use('/mcp', jsonBodyLimit)
+app.use('/oauth/*', jsonBodyLimit)
+app.use('/mcp/*', jsonBodyLimit)
 
 // 6–7. CORS answers preflights before CSRF can reject them; CSRF is cookie-only, no DB.
 app.use('*', corsMiddleware)
@@ -110,6 +127,8 @@ app.use('*', publicSitesMiddleware(serverPlugins))
 // 10. Per-request tracer: OTLP export when a backend is configured + the `ai_spans` store; flushed in
 //    `waitUntil` after the handler. Streaming routes flush again before their stream closes.
 app.use('/api/*', tracerMiddleware)
+app.use('/mcp', tracerMiddleware)
+app.use('/mcp/*', tracerMiddleware)
 
 // 11. Mounts — auth is applied PER MOUNT so the public surface is enumerable: health, /auth/*,
 //    /api/invite/:token (details; accept resolves the cookie itself), /api/identity/events
@@ -121,6 +140,14 @@ app.route('/auth', authRouter)
 app.route('/api/identity', identityEventsRouter)
 app.use('/api/invite/:token/accept', authRateLimit)
 app.route('/api/invite', inviteRouter)
+// The MCP server: an OAuth access token is its only credential, resolved by the route itself
+// (never `authMiddleware`, which takes cookies and API keys). Its own CORS, deployment gate and
+// Origin rule are in `routes/mcp.ts`; the global CORS skips it (`middleware/cors.ts`).
+app.route('/mcp', mcpRouter)
+// Its authorization server and discovery documents — public by nature (a client has no
+// credential yet), each step checking what it needs itself; `routes/oauth.ts`.
+app.route('/oauth', oauthRouter)
+app.route('/.well-known', wellKnownRouter)
 app.use('/api/admin/*', globalAdminMiddleware)
 app.route('/api/admin', adminRouter)
 // WebSocket upgrade resolves the cookie itself (no authMiddleware: browsers can't set headers here).
@@ -158,6 +185,10 @@ const mounts: readonly (readonly [string, Hono<AppEnv>, MiddlewareHandler?])[] =
   ['/api/ai/documents', aiDocumentsRouter],
   // Knowledge facts review (D43): dark unless the tenant has the flag — a 404 `feature_disabled`.
   ['/api/knowledge', knowledgeRouter, requireFeature('knowledge-facts')],
+  // The MCP server's settings (admin+), dark unless the deployment ships `mcp`.
+  ['/api/mcp', mcpSettingsRouter, requireFeature('mcp')],
+  // A person's own AI-client connections across organisations — the deployment gate only.
+  ['/api/mcp-connections', mcpConnectionsRouter, mcpDeploymentGate],
   ['/api/chat', chatRouter],
   // A protocol surface with its own auth story, mounted beside chat rather than under it: this
   // list is the enumerable auth surface.

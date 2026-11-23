@@ -8,15 +8,18 @@ Cloudflare Worker (`apps/web`), a CLI (`apps/cli`), private zod contracts
 > before assuming a capability exists; update it when you change one.**
 > **Setup**: asked for setup help → run `/rf-setup` (it drives `scripts/bootstrap.sh --no-dev`, then
 > starts the server): show each `✔ n/10` line, stop on failure. By hand: `SETUP.md` Part 1.
-> **Fresh copy?** `/rf-adapt <slug>`, then `docs/ADAPTING.md`. `/rf-setup`, `/rf-adapt`, `/rf-preflight`, `/rf-how-do-i`,
-> `/rf-upgrade`, `/rf-traces`, `/rf-evals`, `/rf-agent-replay`, `/rf-agent-docs` and `/rf-plugin` you
-> may run yourself; **`/rf-security` only when asked** (a security audit spends agent calls, about
+> **Starting a new app?** `/rf-start`: detach, setup, the design conversation (`/rf-design`, writes
+> `docs/design/`), then the rename. Settle nothing about the app's design before it asks.
+> **Fresh copy?** `/rf-adapt <slug>`, then `docs/ADAPTING.md`. `/rf-start`, `/rf-design`, `/rf-setup`,
+> `/rf-adapt`, `/rf-preflight`, `/rf-how-do-i`,
+> `/rf-upgrade`, `/rf-traces`, `/rf-evals`, `/rf-agent-replay`, `/rf-agent-docs`, `/rf-mcp` and `/rf-plugin`
+> you may run yourself; **`/rf-security` only when asked** (a security audit spends agent calls, about
 > $35–200+; agree the mode and budget first, `docs/SECURITY-AUDIT.md`); **`/rf-provision` is
 > user-invoked only** (it creates paid resources and prompts for tokens on a TTY) — asked to deploy,
 > tell the user to run `/rf-provision`.
 > **Plugins** (D31, `docs/CONCEPTS.md` §16): a plugin is a git repository copied in, wired through six
 > barrels — `pnpm plugin add|upgrade|remove|list|check`, driven by `/rf-plugin`, which always shows the
-> plan before `--apply`. It imports the host only through the DECLARED entries (`docs/plugin-api.md`,
+> plan before `--apply`. `pnpm plugin list --available` lists what is published: check it before building. It imports the host only through the DECLARED entries (`docs/plugin-api.md`,
 > generated and diff-checked) and receives everything else as injected context. `defaultPlugins` in
 > `.rocketflare.json` is what a fresh clone installs (bootstrap step `6/10 plugins`; kit: `[]`).
 > **Copies of the kit upgrade.** `.rocketflare.json` records the kit version, the app's names and the
@@ -47,11 +50,15 @@ Cloudflare Worker (`apps/web`), a CLI (`apps/cli`), private zod contracts
   spans → Langfuse/Phoenix/any backend, always also `ai_spans` → `my-app traces`); evals (D33:
   `apps/evals`, vitest-evals on vitest 4, `pnpm eval`, never in the gate) + thumbs feedback →
   `my-app evals promote`
+- **MCP**: core server at `/mcp` and `/mcp/t/<slug>` (`services/mcp/`, `routes/mcp.ts`); OAuth only,
+  the app is its own authorization server (no API keys, no cookies); dark unless `FEATURES_ENABLED`
+  names `mcp`. A feature reaches MCP as a TOOL (`.claude/rules/tools.md`), never a route (`/rf-mcp`)
 - **Analytics**: not core — the opt-in `analytics` PLUGIN (D31, `/rf-plugin add analytics`; the
-  bootstrap skips it): drizzle-cube at `/cubejs-api`+`/mcp`, `:15`-cron fact tables, dashboards
+  bootstrap skips it): drizzle-cube at `/cubejs-api`, its cube tools through `tools` (so MCP too),
+  `:15`-cron fact tables, dashboards
 - **UI**: React 19 + Vite, DaisyUI 5 / Tailwind v4, React Router 7, TanStack Query 5; served as `ASSETS`
-- **CLI**: commander + chalk + open; `tsx` in dev, `tsc` → `dist/cli.js` (bin `my-app`)
-- **Tests**: vitest projects `api` · `api-isolated` · `driver` · `ui` · `config` · `kit-only` (the kit's own
+- **CLI**: commander + chalk + open; `tsx` in dev, esbuild → `dist/cli.js` (bin `my-app`)
+- **Tests**: vitest projects `api` · `api-isolated` · `api-fixtures` · `driver` · `ui` · `ui-isolated` · `config` · `config-isolated` · `kit-only` (the kit's own
   tests, `apps/web/tests/kit-only/`, deleted by the rename — never in a copy) (Postgres :5433; the
   suite under `postgres`, then `driver` — the seam's conformance suite — under `neon` through the
   local proxy); cli; the eval kit's unit tests (`apps/evals/tests`). Evals themselves are
@@ -61,14 +68,16 @@ Cloudflare Worker (`apps/web`), a CLI (`apps/cli`), private zod contracts
 ## Commands (from the workspace root)
 
 ```bash
-pnpm bootstrap · pnpm preflight  # first run in one go (--offline/--online toggle [ai]) / read-only check
+pnpm bootstrap · pnpm preflight  # first run in one go (--offline/--online: DEV_WORKERS_AI in .dev.vars) / read-only check
 pnpm dev:db:up && pnpm db:migrate  # Postgres on the first free port from :5432 → DATABASE_URL; role → migrations → grants
 pnpm seed [--demo] && pnpm dev  # tenant/users/key (+ populated workspace); wrangler :3001 + vite :3000 (strict ports)
 pnpm dev:stop · pnpm dev:status · pnpm dev:db:status  # kill this repo's dev tree / port holders / every dev database
 pnpm cli login --server http://localhost:3001  # browser → ~/.my-app/config.json, then whoami
 pnpm gate [step…] · pnpm gate --list [--json]  # THE gate: lint → typecheck → test → build (CI's one job, Launch's ship gate)
+pnpm gate --changed[=<ref>]  # local commits: each step over what the branch changed; full gate before a push
 prek install · prek run  # fast git hooks, not the gate; kit-owned shell scripts skipped
 pnpm test  # every package; starts the test DB + Neon proxy; suite under postgres, then driver under neon
+pnpm test api|ui|config|driver [file…]  # the inner loop: one suite (shared + isolated projects), DB expected up
 TEST_DATABASE_BRANCH=gate-… pnpm test  # a sandbox gate: no Docker, the whole suite on a Neon gate branch (CONCEPTS §4)
 pnpm dev:db:up --neon|--postgres  # D35: local dev on either driver
 pnpm eval [suite] [--model x] [--compare] · pnpm eval:baseline · pnpm eval:view  # real-model evals (D33, docs/EVALS.md)
@@ -92,7 +101,7 @@ apps/web/          @my-app/web — wrangler*.toml, worker-configuration.d.ts, .d
 │  src/config.ts   loadConfig(env): zod over Cloudflare.Env; routes read c.get('config')
 │  src/permissions/  CASL owner/admin/member/support + isGlobalAdmin   src/db/  client, tenant-scope, schema/
 │  src/api/        index.ts (Hono app, middleware order, ASSETS catch-all) · queue.ts · scheduled.ts ·
-│                  middleware/ · auth/ · routes/ (thin) · services/ (ai/, agents/, prompts.ts) ·
+│                  middleware/ · auth/ · routes/ (thin) · services/ (ai/, agents/, mcp/, prompts.ts) ·
 │                  workflows/ · observability/ · utils/ · queues/ · durable-objects/
 │  src/ui/         React app
 │  src/plugins/    D31 seam: types.ts, api/ (the context family a plugin imports) + the
@@ -116,14 +125,8 @@ scripts/           bootstrap.sh → bootstrap.mjs (10 steps), rename.mjs, upgrad
 launch.kit.json    the Launch kit contract (D36): how Launch scaffolds, gates, ships and upgrades a
                    copy — kept by every copy; `node scripts/kit-check.mjs` checks it (CONCEPTS §13)
 docs/upgrades/     one porting note per kit release (+ unreleased.md, kit repo only) — CHANGELOG.md is the index
-.claude/skills/    rf-setup · rf-preflight · rf-adapt (+ checklist.md) · rf-provision (+ reference.md) ·
-                   rf-how-do-i (+ example-orders.md) · rf-upgrade (+ porting.md — port later kit releases) ·
-                   rf-plugin (+ reference.md — install/upgrade/remove a plugin, D31) ·
-                   rf-traces (debug a run from its span tree; pick a tracing backend, D32) ·
-                   rf-evals (+ reference.md — author, run, compare, harvest, baseline, improve; D33) ·
-                   rf-agent-replay (replay an agent's past runs with today's code, no model calls; D38) ·
-                   rf-agent-docs (+ check.mjs — audit and fix CLAUDE.md, rules and skills) ·
-                   rf-security (+ tools/ runner and guard hook — audit against docs/THREAT-MODEL.md)
+.claude/skills/    the rf-* skills named at the top: SKILL.md + any reference/checklist files; rf-agent-docs
+                   ships check.mjs, rf-security tools/ (runner, guard hook)
 ```
 
 **`packages/shared`.** Private, no build: `@my-app/shared/<module>` → `./src/<module>.ts` (incl. `ai/*`,
@@ -163,7 +166,7 @@ consulted only for a flag marked `environmentGated`; the rollout state itself li
 `IDENTITY_WEBHOOK_SECRET` for its identity events).
 
 Rules (auto-loaded by path): `.claude/rules/api.md` · database.md · ui.md · cli.md · testing.md ·
-code-quality.md · cloudflare.md. Runbooks: `docs/DEPLOY.md` · `docs/RLS.md` · `docs/SECURITY-AUDIT.md`
+code-quality.md · cloudflare.md · tools.md. Runbooks: `docs/DEPLOY.md` · `docs/RLS.md` · `docs/SECURITY-AUDIT.md`
 
 ## Non-Negotiables
 

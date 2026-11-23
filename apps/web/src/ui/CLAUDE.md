@@ -21,7 +21,7 @@ streaming, guards, bundle rules, tests) are `.claude/rules/ui.md`, loaded with t
 - `App.tsx` — providers `ErrorBoundary` → `QueryClientProvider` → `AuthProvider` →
   `AbilityProvider` → `WebSocketProvider` → `BrowserRouter`; dev-only `ReactQueryDevtools` in a
   `Suspense`. Route table in three tiers: public (`/login`, `/magic-link/sent`,
-  `/magic-link/confirm`, `/invite/:token`), signed-in (`/cli/confirm`), signed-in-without-tenant (`/select-tenant`, `/pending`,
+  `/magic-link/confirm`, `/invite/:token`), signed-in (`/cli/confirm`), signed-in-without-tenant (`/consent` — an AI client's OAuth consent, `/select-tenant`, `/pending`,
   `/no-access` — `ProtectedRoute requireTenant={false}`), and the shell (`/*` — `ProtectedRoute`,
   `Layout` mounted ONCE, nested `<Routes>` beneath it; each `<main>` has its own `ErrorBoundary`
   reset on pathname). Installed plugins' routes are mapped per tier inside the same `Suspense`; a `workspace`-tier route lives in the shell, and `Layout`'s `workspace` prop gives it the rail, no padding and the full height.
@@ -35,7 +35,7 @@ streaming, guards, bundle rules, tests) are `.claude/rules/ui.md`, loaded with t
 - `components/` — the shell: `Layout` (slots `headerStart` = `OrgSwitcher`, `headerCenter` =
   the `center` plugin header items, `headerEnd` = the `end` plugin header items +
   `NotificationsBell` + `UserMenu`, `sidebarFooter`; `PluginHeaderSlot` renders a placement's
-  `UiPlugin.header` items, each guarded and isolated), `SideNav` (`CORE_NAVIGATION` composed with
+  `UiPlugin.header` items, each guarded and isolated; `PluginHomeCards` renders `UiPlugin.homeCards` on Home the same way), `SideNav` (`CORE_NAVIGATION` composed with
   plugin groups by `composeNav`, filtered by `filterNavConfig`), guards (`ProtectedRoute`,
   `RequireGuard`, `AdminRoute`, `GlobalAdminRoute`), `permissions/` (`AbilityProvider` unpacks
   `session.permissions`; `IfCan`/`IfCannot`), realtime (`WebSocketProvider`, `WebSocketStatus`,
@@ -78,7 +78,10 @@ streaming, guards, bundle rules, tests) are `.claude/rules/ui.md`, loaded with t
   `methods.oidcOnly` shows the one SSO button and never redirects to `/auth/oidc` on its own —
   signing in is always a click. `?as=<email>` (what `pnpm bootstrap` opens) calls
   `POST /auth/dev-login` once on mount, ONLY when `methods.devLogin` is true AND the email is in
-  `DEV_ACCOUNTS`; never widen the allow-list.
+  `DEV_ACCOUNTS` (`lib/dev-accounts.ts` — also what `scripts/seed.ts` creates and the quick-login
+  buttons show); never widen the allow-list beyond the seeded accounts.
+- Roles render through `roleLabel(role)` (`@my-app/shared/tenants` `ROLE_LABELS`), never the
+  raw value with `capitalize`: an app relabels them in one place.
 - No active tenant → `noTenantRoute(session)`: access request → `/pending`; memberships →
   `/select-tenant`; `signupMode === 'approval'` → `/pending`; else `/no-access`. Exception: a
   global admin opens `/admin/*` with no membership (`isAdminPath`; the bootstrap admin must approve

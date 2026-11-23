@@ -47,7 +47,10 @@ import {
   ssoAllows,
   ssoRequiredLoginPath,
 } from '@/api/auth/sso-policy'
-import { MAX_PUBLIC_MOUNT_BODY_BYTES } from '@/api/middleware/body-limit'
+import {
+  MAX_PLUGIN_UPLOAD_LIMIT_BYTES,
+  MAX_PUBLIC_MOUNT_BODY_BYTES,
+} from '@/api/middleware/body-limit'
 import { AGENTS } from '@/api/services/agents/registry'
 import { APP_EVENT_HANDLERS } from '@/api/services/events/app-handlers'
 import { loadConfig } from '@/config'
@@ -74,6 +77,7 @@ import {
   RESERVED_PLUGIN_IDS,
   staticImports,
   uiEntryIssues,
+  uploadLimitIssues,
   uploadPathIssues,
 } from '../helpers/plugins'
 import { createTestEnv } from '../mocks/bindings'
@@ -795,6 +799,18 @@ describe('installed plugins', () => {
     )
   })
 
+  it('declares upload limits on its own exact paths, within the host ceiling', () => {
+    expect(uploadLimitIssues('orders', { '/api/orders/upload': 25 * 1024 * 1024 })).toEqual([])
+    expect(uploadLimitIssues('orders', { '/api/files': 1 })).toHaveLength(1)
+    expect(uploadLimitIssues('orders', { '/api/orders/': 1 })).toHaveLength(1)
+    expect(uploadLimitIssues('orders', { '/api/orders/upload': 0 })).toHaveLength(1)
+    expect(uploadLimitIssues('orders', { '/api/orders/upload': 1.5 })).toHaveLength(1)
+    expect(
+      uploadLimitIssues('orders', { '/api/orders/upload': MAX_PLUGIN_UPLOAD_LIMIT_BYTES + 1 })
+    ).toHaveLength(1)
+    expect(serverPlugins.flatMap(p => uploadLimitIssues(p.shared.id, p.uploadLimits))).toEqual([])
+  })
+
   it('declares public-mount guards within the host ceilings', () => {
     const issues = serverPlugins.flatMap(p =>
       (p.publicMounts ?? []).flatMap(([prefix, , options]) =>
@@ -960,19 +976,9 @@ describe('installed plugins', () => {
  * reach `JobTypeOf` / `AgentKeyOf` / `FeatureKeyOf` without anything being installed for it.
  */
 describe('the closed sets a plugin opens', () => {
-  it('name the kit exactly, and widen for what is installed', () => {
-    expectTypeOf<CoreJobType>().toEqualTypeOf<
-      | 'email.send'
-      | 'activity.record'
-      | 'document.index'
-      | 'document.convert'
-      | 'document.reembed'
-      | 'chat.compact'
-      | 'tenant.purge'
-      | 'event.deliver'
-      | 'knowledge.extract'
-    >()
-    // A plugin may only WIDEN the kit's set — the property the whole "variants are data" change
+  it('widen for what is installed', () => {
+    // The kit's exact set is `tests/kit-only/kit-makeup.test.ts`: an app adds core job types of its
+    // own. A plugin may only WIDEN the kit's set — the property the whole "variants are data" change
     // bought. Which types a particular plugin adds is that plugin's own test to make.
     expectTypeOf<CoreJobType>().toMatchTypeOf<JobType>()
     // The envelope narrows per type — what a handler is handed, and the reason `runHandler`'s

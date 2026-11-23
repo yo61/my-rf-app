@@ -109,7 +109,7 @@
       {
         "id": "analytics",
         "repo": "https://github.com/rocketflare-dev/rocketflare-plugins.git",
-        "ref": "3.12.0",
+        "ref": "3.14.0",
         "subdir": "plugins/analytics"
       }
     ],

@@ -38,6 +38,8 @@ repos:
         exclude: &kit_scripts |-
           (?x)^(
             scripts/bootstrap\.sh|
+            scripts/detach\.sh|
+            scripts/lib/prereqs\.sh|
             apps/web/scripts/cf-provision\.sh|
             apps/web/docker/neon-proxy-start\.sh
           )$

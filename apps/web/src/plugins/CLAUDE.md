@@ -37,7 +37,10 @@ host ever names a plugin.
   `@testkit/{integration,unit}` is for its tests; `@/host/<id>/…` (its OWN id) for the host files it
   seeded. `tests/helpers/plugins.ts` enforces it. **Annotate
   the context explicitly**: `ctx.notFound()` narrows (`never`) only on an explicitly typed target,
-  so `const ctx = requestCtx(c)` leaves the row possibly undefined.
+  so `const ctx = requestCtx(c)` leaves the row possibly undefined. `ctx.apiKeyId` names the API
+  key a Bearer request came in on (`null` for a browser session; never the secret) — key a
+  per-client limit or audit line on it, because `ctx.userId` is the key's CREATOR and every key
+  one person made shares it.
 - **Module-evaluation order is the one trap the type system cannot see.** `queues/jobs.ts`,
   `agents/registry.ts`, `prompts.ts`, `scheduled.ts`, `api-prefixes.ts` and `access.ts` read the
   barrels at MODULE SCOPE; a plugin module reading one of their values at its own module scope
@@ -82,8 +85,9 @@ the CLI command `<id>`; skills `<id>` / `<id>-<what>`; AG-UI CUSTOM events `<id>
 ## Server slots (`ServerPlugin`)
 
 - **Its routes are kit routes in every respect** — `createRouter()`, `validate()` with a contract
-  from its own shared entry, `ctx.guard` with its own subject, typed errors, a tenant predicate on
-  every query. Only REGISTRATION differs: `mounts` (`['/api/<id>', router, middleware?]`), spread
+  from its own shared entry, `ctx.guard` with its own subject, typed errors (`ctx.notFound()`… in a
+  route; the same classes, `NotFoundError`, `ForbiddenError`…, from `@/plugins/api` in a tool or a
+  job), a tenant predicate on every query. Only REGISTRATION differs: `mounts` (`['/api/<id>', router, middleware?]`), spread
   LAST.
 - **A feature flag gates the MOUNT, not each route** — `requireFeature('<id>')` as the third element
   (404 `feature_disabled`); never `access Feature:<id>` (global admins' `manage all` passes it).
@@ -151,6 +155,12 @@ the CLI command `<id>`; skills `<id>` / `<id>-<what>`; AG-UI CUSTOM events `<id>
   `invalid_custom_event`. Validate the body and do anything else that can fail BEFORE calling it.
   Test it with `scriptPlatformChat(env, turns)` from `@testkit/integration`, never a `vi.mock` of
   the resolver.
+- **A route serving a PDF a page frames calls `ctx.embeddable(row.contentType)`** — the type from
+  YOUR row, before any 304 early return; only an `EMBEDDABLE_MIME_TYPES` type is let through
+  (`SAMEORIGIN` + `frame-ancestors 'self'` for that response). Never a header of your own.
+- **A file above 10 MB** goes to an exact path in `uploadLimits` (`{ '/api/<id>/upload': bytes }`,
+  ≤ 50 MiB, `uploadLimitIssues`), never a wider `uploadPaths` prefix; the route still mounts its own
+  `bodyLimit` and checks each file.
 - **Storage is `ctx.storage()`** (keyed `tenants/<tenantId>/<id>/…`, so `tenant.purge` removes it),
   never `env.FILES` with a hand-built prefix.
 - **Knowledge goes through `ingestDocument` / `ingestDocumentFile`**, never a `documents` insert:
@@ -180,18 +190,36 @@ the CLI command `<id>`; skills `<id>` / `<id>-<what>`; AG-UI CUSTOM events `<id>
   retry). A job whose payload carries a `tenantId` is acked unrun while that tenant is not
   `active` (suspended or deleted), so work that must happen on suspension belongs in
   `onTenantStatusChanged`, not in a job (`src/api/queues/CLAUDE.md`).
-- **`agentTools(ctx)`** is bound to the run's `AgentToolContext` (its `AccessScope`: read what the
+- **`tools(ctx)`** (the old name `agentTools` still works and draws a `plugin check` warning) is
+  bound to the caller's `AgentToolContext` (its `AccessScope`: read what the
   REQUESTER may read, never a `tenantId` it chose). A tool that writes is offered on
-  `ToolCtx.can('manage', YOUR_SUBJECT)`, never on `scope.bypass`, which is row visibility. A tool
+  `ToolCtx.can('manage', YOUR_SUBJECT)`, never on `scope.bypass`, which is row visibility.
+  `ToolCtx.requester` (`{ userId, role, isAdmin, groups }`, null with nobody behind the run) is
+  the caller's own role and groups, already resolved — scope by it, never query for them. A tool
   that fetches a URL reads only one in `ToolCtx.requesterUrls` (what the person typed) or one its
   own search returned — never a URL the model, a page or a document supplied. Appended after the kit's three knowledge tools;
   `[]` for a tenant without it; a throw is logged and skipped. A test pinning the tool list must be
-  a prefix assertion.
+  a prefix assertion. Each tool says where it is offered — `surfaces: ['chat' | 'agents' | 'mcp']`,
+  absent = all, filtered by `toolsFor(surface, ctx)` — and how an MCP client sees it in `mcp: {
+  title?, annotations?, outputSchema?, scope? }` (defaults from `sideEffects`: `mcp:read` and
+  read-only, or `mcp:write` and destructive). Terminal and approval-gated tools never reach `mcp`.
+  **Name it `<namespace>_<verb>`**: 1–64 of `A–Z a–z 0–9 _ -` (no `.` — the chat models refuse it),
+  never a core tool's or another plugin's name — the builder drops such a tool and `plugin check`
+  fails it. Never "My App" in its `title`/`description` (a client shows the deployment's name).
+- **MCP needs nothing else**: no mount, no auth, no token check — `/mcp` resolves the person and
+  hands the tool the same `ToolCtx`. Never mount on `/mcp`, `/oauth/*` or `/.well-known/oauth-*`
+  (refused at load and by `plugin check`). **Prove it scopes over MCP** with `callMcpTool(db, tool,
+  { as, tenant })` from `@testkit/integration` as a member of a second organisation (and outside
+  a group, for group-visible rows) — `example-feature`'s "over MCP" cases are the template; the
+  full safe-tool checklist is `.claude/rules/tools.md`.
 - **`grants` are ADDITIVE over its OWN subjects** (declared in `SharedPlugin.subjects`), applied
   after the kit's matrix; never `cannot` — that would change what every role may do.
-- **`hooks.onTenantCreated` / `onTenantDeleted` / `onTenantStatusChanged` / `seedDemo` are post-commit, idempotent,
+- **`hooks.onTenantCreated` / `onTenantDeleted` / `onTenantStatusChanged` / `seed` / `seedDemo` are post-commit, idempotent,
   best-effort**, try/caught after the kit's own — nothing a tenant NEEDS may arrive only that way.
-  `seedDemo` gets a namespaced `demoId`; fixed ids + `onConflictDoNothing`.
+  `seed` runs on every `pnpm seed` (reference data the plugin needs), `seedDemo` only with
+  `--demo`; both get a namespaced `demoId` (fixed ids + `onConflictDoNothing`) and
+  `setFeature(key, enabled?, tenantId?)` — the per-organisation override that shows a plugin
+  behind its own flag after a plain seed.
 - **`onTenantStatusChanged(db, tenantId, status, env)`** runs after a suspend / reactivate
   (`setTenantSuspended`), each failure logged and swallowed — invalidate anything the plugin
   serves or caches for the tenant outside the auth middleware (public pages, KV, edge caches).
@@ -225,13 +253,21 @@ the CLI command `<id>`; skills `<id>` / `<id>-<what>`; AG-UI CUSTOM events `<id>
   lazy PAGE.
 - **`nav` is a list of GROUPS** spliced by `composeNav(CORE_NAVIGATION, …)`: `before: '<label>'`
   inserts before that core group, no `before` lands above "Organisation", an unknown label appends;
-  `filterNavConfig` applies the same guards. `settingsTabs(ctx)` append after the kit's.
+  `filterNavConfig` applies the same guards. `settingsTabs(ctx)` append after the kit's; a tab
+  (`PluginSettingsTab`) may carry a `guard` — the same `NavGuard`, checked by the host — so
+  `{ feature: '<id>' }` hides it in an organisation without the feature, which `can` cannot
+  (a plugin's grants hold in every organisation).
 - **`header` items** (`{ id, Component: lazy(...), guard?, order?, placement?: 'center' | 'end' }`)
   go in the top bar via `PluginHeaderSlot` — `center` for a search box, `end` (default) before the
   kit's widgets; sorted by `order`, plugin id, item id; each in its own `Suspense` + error
   boundary, so a throw renders nothing. Keep one compact at every width (an icon button below
   `sm`); a palette or drawer it opens is its own lazy chunk. Guard it with the same const as the
   route it serves.
+- **`homeCards`** (`{ id, Component: lazy(...), guard?, order? }`) are Home's "what needs doing"
+  section, above the quick links, via `PluginHomeCards` — same ordering and isolation as `header`.
+  A card with nothing to ask renders `null`. The core quick links are data in
+  `pages/home-links.ts`: the plugin UI kit must never import the Home PAGE
+  (`tests/config/plugin-ui-kit-graph.test.ts`), or `apps/evals` compiles Home's whole graph.
 - **`useNavigationEntries()`** (`@/plugins/api/ui`, so from a lazy page or palette) lists every
   destination the reader may open: composed nav, settings tabs (`pages/settings/tabs.ts` + plugins'
   `settingsTabs`) and Home links, each through `useNavGuard`, first entry per path wins.

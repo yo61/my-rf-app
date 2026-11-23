@@ -129,7 +129,8 @@ TanStack Query owns server state — never add a store for it. zustand owns only
 - `components/ai/` (`Markdown`, `ChatBubble`, `StatRows`) is NOT in the eager `components/shared`
   barrel. Import it by path ONLY from `pages/chat/**`, `pages/agents/**` and
   `pages/documents/DocumentViewPage.tsx`; nothing under `components/shared` may import a markdown
-  renderer (`tests/config/ui-bundle.test.ts` asserts both). `Markdown` shows images as links
+  renderer (`tests/config/ui-bundle.test.ts` checks the source, and `scripts/check-ui-bundle.mjs`
+  checks the built chunks after every `build:ui`). `Markdown` shows images as links
   (`MarkdownImageLink`, also for a plugin's own renderer): text from a model or document must not make the
   browser fetch anything by itself. Model output renders through `Markdown`
   (`skipHtml`, links `noopener`), never `dangerouslySetInnerHTML`; user text verbatim
@@ -154,4 +155,6 @@ its eager-entry import allowlist: `apps/web/src/plugins/CLAUDE.md`.
 
 A plugin's top-bar control is a `UiPlugin.header` item rendered by `PluginHeaderSlot`, never an
 edit to `Layout` or `App.tsx`: each item sits behind its own guard, `Suspense` and error boundary,
-so a header item that throws must render nothing rather than break the shell.
+so a header item that throws must render nothing rather than break the shell. A card on Home is a
+`UiPlugin.homeCards` entry rendered by `PluginHomeCards` the same way, never an edit to `Home.tsx`;
+the core quick links are data in `pages/home-links.ts`, which hooks import instead of the page.

@@ -5,20 +5,21 @@
     "id": "rocketflare",
     "name": "rocketflare",
     "repo": "https://github.com/rocketflare-dev/rocketflare.git",
-    "version": "0.40.0",
-    "commit": "bc06e2632918a4025d4ac9535ea2fb52cd07f655"
+    "version": "0.44.1",
+    "commit": "35c7a7b5072475bbfe4add243a27bc6d6f25494d"
   },
   "app": {
     "slug": "my-app",
     "display": "My App",
     "domain": "my-app.example.com"
   },
+  "kitOnlyScripts": ["kit:release", "test:kit-only"],
   "$defaultPlugins": "The plugins a FRESH clone installs before the app is first run (D31, docs/CONCEPTS.md §16). `scripts/bootstrap.mjs`'s `plugins` step reads it, skips every id already recorded as a surface, runs `pnpm plugin add <repo>[@ref] --apply` for the rest and then generates and applies their migration; `pnpm bootstrap --no-plugins` skips it. Each entry is { \"id\", \"repo\", \"ref\"?, \"subdir\"? } — the id is what answers \"is this one already here?\" without fetching anything. Analytics is here because the kit is bare from 0.6.0: a fresh clone still gets dashboards, cubes and the drizzle-cube API, but as an installed plugin rather than as core.",
   "defaultPlugins": [
     {
       "id": "analytics",
       "repo": "https://github.com/rocketflare-dev/rocketflare-plugins.git",
-      "ref": "3.12.0",
+      "ref": "3.14.0",
       "subdir": "plugins/analytics"
     }
   ],
@@ -112,6 +113,36 @@
       "from": "0e1eb482384fd662f0f0e4a9e155025c0ee31822",
       "to": "bc06e2632918a4025d4ac9535ea2fb52cd07f655",
       "at": "2026-11-19"
+    },
+    {
+      "from": "bc06e2632918a4025d4ac9535ea2fb52cd07f655",
+      "to": "2d5782cf8696ef466f35d75fead14a603798b787",
+      "at": "2026-11-23"
+    },
+    {
+      "from": "2d5782cf8696ef466f35d75fead14a603798b787",
+      "to": "5e0590631a1ecfb0c24bc46795d9e30fcf427b10",
+      "at": "2026-11-23"
+    },
+    {
+      "from": "5e0590631a1ecfb0c24bc46795d9e30fcf427b10",
+      "to": "b2dc9fe6416df742c5603b728a8f093d9347297a",
+      "at": "2026-11-23"
+    },
+    {
+      "from": "b2dc9fe6416df742c5603b728a8f093d9347297a",
+      "to": "f2d46ced3b989db2a51abaab0b4349965cb48a8d",
+      "at": "2026-11-23"
+    },
+    {
+      "from": "f2d46ced3b989db2a51abaab0b4349965cb48a8d",
+      "to": "98d810b18ca85d0adb2e54f27c1c376aaaae9851",
+      "at": "2026-11-23"
+    },
+    {
+      "from": "98d810b18ca85d0adb2e54f27c1c376aaaae9851",
+      "to": "35c7a7b5072475bbfe4add243a27bc6d6f25494d",
+      "at": "2026-11-23"
     }
   ],
   "surfaces": [
@@ -271,7 +302,9 @@
         ".claude/skills/rf-agent-replay/**",
         "packages/shared/src/ai/agents.ts",
         "apps/web/src/plugins/api/agent-runs.ts",
-        "apps/web/tests/api/plugin-agent-runs.test.ts"
+        "apps/web/tests/api/plugin-agent-runs.test.ts",
+        "apps/web/tests/api/agent-run-routes.test.ts",
+        "apps/web/tests/api/agent-run-runtime.test.ts"
       ],
       "registries": [
         "apps/web/src/worker.ts",
@@ -347,11 +380,11 @@
       "source": {
         "repo": "https://github.com/rocketflare-dev/rocketflare-plugins.git",
         "subdir": "plugins/analytics",
-        "version": "3.12.0",
-        "commit": "2b5b3cb90c3923a5ffc845d6aaf5c7d6c56fe01a"
+        "version": "3.14.0",
+        "commit": "c3957bdbed50d0ad43a7df3717debb0d9016c73e"
       },
       "installedAt": "2026-11-02",
-      "minKit": "0.29.0",
+      "minKit": "0.41.0",
       "requires": {
         "surfaces": [],
         "plugins": []
@@ -384,6 +417,11 @@
           "from": "9a7f3428eb06c4cd2b13eb915b9b4ce1cb2ea6b5",
           "to": "2b5b3cb90c3923a5ffc845d6aaf5c7d6c56fe01a",
           "at": "2026-11-19"
+        },
+        {
+          "from": "2b5b3cb90c3923a5ffc845d6aaf5c7d6c56fe01a",
+          "to": "c3957bdbed50d0ad43a7df3717debb0d9016c73e",
+          "at": "2026-11-23"
         }
       ]
     },
@@ -398,14 +436,13 @@
   ],
   "neverPort": [
     "LICENSE",
+    "LICENSES/**",
     "SECURITY.md",
     "pnpm-lock.yaml",
     "CHANGELOG.md",
     "docs/ADAPTING.md",
     ".claude/skills/rf-adapt/**",
     "scripts/rename.mjs",
-    "scripts/lib/rename-lib.mjs",
-    "scripts/lib/rename-lib.d.mts",
     "apps/web/wrangler.toml",
     "apps/web/wrangler.staging.toml",
     "apps/web/.dev.vars.example",
@@ -414,7 +451,7 @@
     "apps/web/src/ui/public/**",
     ".rocketflare.json"
   ],
-  "$kitOnly": "What is true of the kit repository and of nothing made from it. The kit's OWN tests (its release notes and version chain, the release and rename machinery, the maintainer hooks, the plugin CI plugin repositories call from here, and this file's kit-state invariants — docs/CONCEPTS.md §13), the kit's OWN workflows (kit.yml, plugin-ci.yml, notify-plugins.yml), its maintainer scripts (the release cutter, the porting-note and release-site nudges, the default-plugins CI helper, the curl installer) and its project files (CONTRIBUTING.md, CODE_OF_CONDUCT.md). `scripts/rename.mjs` deletes every file under these globs when a copy is born, unwires their vitest project (`kit-only`), drops every package.json script and `.claude/settings.json` hook that names one; `pnpm kit:upgrade` never ports one (it also honours the TARGET kit's list); and `apps/web/tests/config/kit-manifest.test.ts` fails a copy that carries one. `apps/web/tests/kit-only/**` is also the built-in floor (`KIT_ONLY_PATHS` in scripts/lib/upgrade-lib.mjs) for a copy whose manifest predates this key.",
+  "$kitOnly": "What is true of the kit repository and of nothing made from it. The kit's OWN tests (its release notes and version chain, the release and rename machinery, the maintainer hooks, the plugin CI plugin repositories call from here, this file's kit-state invariants, and the tests of the kit's tooling — scripts/** and the rf-security runner, which a copy runs but receives already tested — docs/CONCEPTS.md §13), the kit's OWN workflows (kit.yml, plugin-ci.yml, notify-plugins.yml), its maintainer scripts (the release cutter, the porting-note and release-site nudges, the default-plugins CI helper, the curl installer) and its project files (CONTRIBUTING.md, CODE_OF_CONDUCT.md). `scripts/rename.mjs` deletes every file under these globs when a copy is born, unwires their vitest project (`kit-only`), drops every package.json script and `.claude/settings.json` hook that names one; `pnpm kit:upgrade` never ports one (it also honours the TARGET kit's list); and `apps/web/tests/config/kit-manifest.test.ts` fails a copy that carries one. `apps/web/tests/kit-only/**` is also the built-in floor (`KIT_ONLY_PATHS` in scripts/lib/upgrade-lib.mjs) for a copy whose manifest predates this key.",
   "kitOnly": [
     "apps/web/tests/kit-only/**",
     ".github/workflows/kit.yml",
