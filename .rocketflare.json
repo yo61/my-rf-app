@@ -5,8 +5,8 @@
     "id": "rocketflare",
     "name": "rocketflare",
     "repo": "https://github.com/rocketflare-dev/rocketflare.git",
-    "version": "0.43.0",
-    "commit": "f2d46ced3b989db2a51abaab0b4349965cb48a8d"
+    "version": "0.44.0",
+    "commit": "98d810b18ca85d0adb2e54f27c1c376aaaae9851"
   },
   "app": {
     "slug": "my-app",
@@ -132,6 +132,11 @@
     {
       "from": "b2dc9fe6416df742c5603b728a8f093d9347297a",
       "to": "f2d46ced3b989db2a51abaab0b4349965cb48a8d",
+      "at": "2026-11-23"
+    },
+    {
+      "from": "f2d46ced3b989db2a51abaab0b4349965cb48a8d",
+      "to": "98d810b18ca85d0adb2e54f27c1c376aaaae9851",
       "at": "2026-11-23"
     }
   ],
@@ -433,8 +438,6 @@
     "docs/ADAPTING.md",
     ".claude/skills/rf-adapt/**",
     "scripts/rename.mjs",
-    "scripts/lib/rename-lib.mjs",
-    "scripts/lib/rename-lib.d.mts",
     "apps/web/wrangler.toml",
     "apps/web/wrangler.staging.toml",
     "apps/web/.dev.vars.example",
