@@ -5,8 +5,8 @@
     "id": "rocketflare",
     "name": "rocketflare",
     "repo": "https://github.com/rocketflare-dev/rocketflare.git",
-    "version": "0.41.1",
-    "commit": "5e0590631a1ecfb0c24bc46795d9e30fcf427b10"
+    "version": "0.42.0",
+    "commit": "b2dc9fe6416df742c5603b728a8f093d9347297a"
   },
   "app": {
     "slug": "my-app",
@@ -122,6 +122,11 @@
     {
       "from": "2d5782cf8696ef466f35d75fead14a603798b787",
       "to": "5e0590631a1ecfb0c24bc46795d9e30fcf427b10",
+      "at": "2026-11-23"
+    },
+    {
+      "from": "5e0590631a1ecfb0c24bc46795d9e30fcf427b10",
+      "to": "b2dc9fe6416df742c5603b728a8f093d9347297a",
       "at": "2026-11-23"
     }
   ],
@@ -414,6 +419,7 @@
   ],
   "neverPort": [
     "LICENSE",
+    "LICENSES/**",
     "SECURITY.md",
     "pnpm-lock.yaml",
     "CHANGELOG.md",
